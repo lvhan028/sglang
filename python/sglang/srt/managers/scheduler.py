@@ -6227,45 +6227,73 @@ class Scheduler(
         return ctrl
 
     def _validate_tpe_phase1a_runtime(self) -> None:
-        """Validate Phase 1a support matrix before executing TPE transactions."""
+        """Validate Phase 1a support matrix against resolved runtime context (R2)."""
+        from sglang.srt.model_executor.cuda_graph_config import Backend
         from sglang.srt.tpe.state import assert_phase1a_config
 
-        server_args = getattr(self, "server_args", None)
-        if server_args is None:
-            return
-        enable_overlap = not getattr(server_args, "disable_overlap_schedule", True)
-        prefill_backend = getattr(server_args, "cuda_graph_backend_prefill", "disabled")
-        decode_backend = getattr(server_args, "cuda_graph_backend_decode", "full")
+        exec_cfg = get_exec()
+        graph_cfg = getattr(exec_cfg.graph, "cuda_graph_config", None)
+        if graph_cfg is None:
+            raise ValueError(
+                "Invalid TPE Phase 1a configuration: resolved cuda_graph_config is missing."
+            )
+        prefill_disabled = graph_cfg.prefill.backend == Backend.DISABLED
+        decode_full = graph_cfg.decode.backend == Backend.FULL
+        enable_torch_compile = bool(exec_cfg.graph.enable_torch_compile)
+        enable_mega_or_mono = bool(
+            exec_cfg.kernel.enable_nvidia_megakernel
+            or exec_cfg.kernel.enable_amd_monokernel
+        )
+        enable_post_capture_kv_sizing = bool(
+            envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
+        )
+        enable_speculative = get_spec().speculative_algorithm is not None
+        disaggregation_mode = str(get_disagg().disaggregation_mode or "null")
+        parallel_cfg = get_parallel()
+        memory_cfg = get_memory()
+        enable_overlap = bool(getattr(self, "enable_overlap", False))
+
         assert_phase1a_config(
-            prefill_cuda_graph_disabled=(str(prefill_backend).lower() == "disabled"),
-            decode_cuda_graph_full=(str(decode_backend).lower() in ("full", "default", "none")),
-            enable_torch_compile=bool(getattr(server_args, "enable_torch_compile", False)),
-            enable_megakernel_or_monokernel=bool(
-                getattr(server_args, "enable_megakernel", False)
-                or getattr(server_args, "enable_monokernel", False)
-            ),
-            enable_post_capture_kv_sizing=(
-                os.environ.get("SGLANG_ENABLE_POST_CAPTURE_KV_SIZING", "0") == "1"
-            ),
-            enable_speculative=(getattr(server_args, "speculative_algorithm", None) is not None),
-            disaggregation_mode=str(getattr(server_args, "disaggregation_mode", "null") or "null"),
-            pp_size=int(getattr(server_args, "pp_size", 1) or 1),
-            ep_size=int(getattr(server_args, "ep_size", 1) or 1),
-            enable_dp_attention=bool(getattr(server_args, "enable_dp_attention", False)),
-            enable_hierarchical_cache=bool(getattr(server_args, "enable_hierarchical_cache", False)),
+            prefill_cuda_graph_disabled=prefill_disabled,
+            decode_cuda_graph_full=decode_full,
+            enable_torch_compile=enable_torch_compile,
+            enable_megakernel_or_monokernel=enable_mega_or_mono,
+            enable_post_capture_kv_sizing=enable_post_capture_kv_sizing,
+            enable_speculative=enable_speculative,
+            disaggregation_mode=disaggregation_mode,
+            pp_size=int(parallel_cfg.pp_size),
+            ep_size=int(parallel_cfg.ep_size),
+            enable_dp_attention=bool(parallel_cfg.enable_dp_attention),
+            enable_hierarchical_cache=bool(memory_cfg.enable_hierarchical_cache),
             enable_overlap=enable_overlap,
         )
 
-    def _reject_tpe_generation_req(self, tokenized_req, reason: str) -> None:
+    def _reject_tpe_generation_req(
+        self, tokenized_req, reason: str, *, status_code: int = 409
+    ) -> None:
         abort_req = AbortReq(
             rid=getattr(tokenized_req, "rid", ""),
             abort_message=reason,
+            finished_reason={
+                "type": "abort",
+                "message": reason,
+                "status_code": status_code,
+            },
         )
         self.send_abort_output(abort_req, tokenized_req)
 
     def _filter_tpe_admitted_request(self, recv_req):
-        """Enforce TPE admission control on incoming generation requests (N1)."""
+        """Enforce TPE admission control on incoming generation requests (N1, R1)."""
         from sglang.srt.tpe.controller import parse_tpe_admission_key
+        from sglang.srt.tpe.state import TpeAdmissionMode, TpeInstanceState
+
+        def _reject_status(ctrl) -> int:
+            if ctrl.admission_mode == TpeAdmissionMode.CLOSED or ctrl.state in (
+                TpeInstanceState.TAINTED,
+                TpeInstanceState.RESTARTING,
+            ):
+                return 503
+            return 409
 
         if isinstance(recv_req, TokenizedGenerateReqInput):
             ctrl = self._get_tpe_controller()
@@ -6280,6 +6308,7 @@ class Scheduler(
                 self._reject_tpe_generation_req(
                     recv_req,
                     f"TPE admission rejected (mode={ctrl.admission_mode.value}, state={ctrl.state.value})",
+                    status_code=_reject_status(ctrl),
                 )
                 return None
             return recv_req
@@ -6300,6 +6329,7 @@ class Scheduler(
                     self._reject_tpe_generation_req(
                         sub_req,
                         f"TPE admission rejected (mode={ctrl.admission_mode.value}, state={ctrl.state.value})",
+                        status_code=_reject_status(ctrl),
                     )
             if not admitted:
                 return None
@@ -6314,12 +6344,33 @@ class Scheduler(
                 stream.synchronize()
         current_platform.synchronize()
 
+    def _tpe_snapshot_canary_counts(self) -> None:
+        mr = getattr(self.tp_worker, "model_runner", None)
+        canary_mgr = getattr(mr, "canary_manager", None) if mr is not None else None
+        if canary_mgr is not None and hasattr(canary_mgr, "snapshot_kernel_run_counts"):
+            self._tpe_baseline_canary_counts = canary_mgr.snapshot_kernel_run_counts()
+        else:
+            self._tpe_baseline_canary_counts = None
+
     def _tpe_finalize_canary(self) -> Dict[str, Any]:
         mr = getattr(self.tp_worker, "model_runner", None)
         canary_mgr = getattr(mr, "canary_manager", None) if mr is not None else None
+        baseline_counts = getattr(self, "_tpe_baseline_canary_counts", None)
+        self._tpe_baseline_canary_counts = None
         if canary_mgr is not None and hasattr(canary_mgr, "finalize_job_check"):
-            return canary_mgr.finalize_job_check()
-        return {"canary_enabled": False, "canary_violations_detected": False}
+            summary = canary_mgr.finalize_job_check(
+                run_final_sweep=True,
+                baseline_kernel_counts=baseline_counts,
+                raise_on_violation=False,
+            )
+            summary.setdefault("canary_enabled", True)
+            summary.setdefault("skipped", False)
+            return summary
+        return {
+            "canary_enabled": False,
+            "skipped": True,
+            "violations_detected": False,
+        }
 
     def _tpe_clear_keep_alive(self) -> None:
         buf = getattr(self, "batch_record_buf", None)
@@ -6414,6 +6465,8 @@ class Scheduler(
                     job_id=recv_req.job_id,
                     instance_generation=recv_req.instance_generation,
                 )
+                if not self.is_fully_idle():
+                    raise RuntimeError("hot_reload requires scheduler to be fully idle (R4)")
                 if recv_req.code_utf8 is None:
                     raise ValueError("hot_reload requires code_utf8")
                 try:
@@ -6435,6 +6488,7 @@ class Scheduler(
                             f"hot_reload failed after activation: {type(exc).__name__}: {exc}"
                         )
                     raise
+                self._tpe_snapshot_canary_counts()
                 ctrl.mark_candidate_ready(recv_req.job_id, cand.artifact_hash)
                 self.send_control_output(
                     TpeTransactionReqOutput(
@@ -6458,6 +6512,8 @@ class Scheduler(
                     job_id=recv_req.job_id,
                     instance_generation=recv_req.instance_generation,
                 )
+                if not self.is_fully_idle():
+                    raise RuntimeError("teardown requires scheduler to be fully idle (R4)")
                 flushed = self.flush_cache()
                 if not flushed:
                     raise RuntimeError(

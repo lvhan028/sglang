@@ -96,10 +96,77 @@ tpe_hot_reload = _load_module_direct(
     "sglang.srt.model_executor.model_runner_components.hot_reload",
     "python/sglang/srt/model_executor/model_runner_components/hot_reload.py",
 )
+class _FakeBackend:
+    DISABLED = "disabled"
+    FULL = "full"
+    PIECEWISE = "piecewise"
+
+
+if "sglang.srt.model_executor.cuda_graph_config" not in sys.modules:
+    _cg_mod = types.ModuleType("sglang.srt.model_executor.cuda_graph_config")
+    _cg_mod.Backend = _FakeBackend
+    sys.modules["sglang.srt.model_executor.cuda_graph_config"] = _cg_mod
+
 tpe_graph_adapter = _load_module_direct(
     "sglang.srt.model_executor.model_runner_components.tpe_graph_adapter",
     "python/sglang/srt/model_executor/model_runner_components/tpe_graph_adapter.py",
 )
+record_baseline_mod = _load_module_direct(
+    "tpe_record_baseline", "scripts/tpe/record_baseline.py"
+)
+
+
+def _make_resolved_runtime_globals(
+    *,
+    prefill_backend=_FakeBackend.DISABLED,
+    decode_backend=_FakeBackend.FULL,
+    graph_cfg_missing: bool = False,
+    enable_torch_compile: bool = False,
+    enable_nvidia_megakernel: bool = False,
+    enable_amd_monokernel: bool = False,
+    post_capture_kv_sizing: bool = False,
+    speculative_algorithm=None,
+    disaggregation_mode: str = "null",
+    pp_size: int = 1,
+    ep_size: int = 1,
+    enable_dp_attention: bool = False,
+    enable_hierarchical_cache: bool = False,
+) -> Dict[str, Any]:
+    graph_cfg = (
+        None
+        if graph_cfg_missing
+        else types.SimpleNamespace(
+            prefill=types.SimpleNamespace(backend=prefill_backend),
+            decode=types.SimpleNamespace(backend=decode_backend),
+        )
+    )
+    exec_cfg = types.SimpleNamespace(
+        graph=types.SimpleNamespace(
+            cuda_graph_config=graph_cfg,
+            enable_torch_compile=enable_torch_compile,
+        ),
+        kernel=types.SimpleNamespace(
+            enable_nvidia_megakernel=enable_nvidia_megakernel,
+            enable_amd_monokernel=enable_amd_monokernel,
+        ),
+    )
+    envs_stub = types.SimpleNamespace(
+        SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=types.SimpleNamespace(
+            get=lambda: post_capture_kv_sizing
+        )
+    )
+    return {
+        "get_exec": lambda: exec_cfg,
+        "get_spec": lambda: types.SimpleNamespace(speculative_algorithm=speculative_algorithm),
+        "get_disagg": lambda: types.SimpleNamespace(disaggregation_mode=disaggregation_mode),
+        "get_parallel": lambda: types.SimpleNamespace(
+            pp_size=pp_size, ep_size=ep_size, enable_dp_attention=enable_dp_attention
+        ),
+        "get_memory": lambda: types.SimpleNamespace(
+            enable_hierarchical_cache=enable_hierarchical_cache
+        ),
+        "envs": envs_stub,
+    }
 
 
 class _DummyModel:
@@ -398,6 +465,7 @@ class TestExtractedProductionBehavior(unittest.TestCase):
         class _FakeAbortReq:
             rid: str
             abort_message: str = ""
+            finished_reason: Optional[Dict[str, Any]] = None
 
         extra_globals = {
             "TokenizedGenerateReqInput": _FakeGenReq,
@@ -429,7 +497,7 @@ class TestExtractedProductionBehavior(unittest.TestCase):
 
         ctrl = tpe_ctrl.TpeSchedulerController(instance_generation=1)
         dispatched: List[Any] = []
-        aborted: List[str] = []
+        aborted: List[_FakeAbortReq] = []
 
         sched = types.SimpleNamespace(
             session_controller=types.SimpleNamespace(maybe_reap=lambda now: None),
@@ -439,37 +507,25 @@ class TestExtractedProductionBehavior(unittest.TestCase):
             external_corpus_manager=None,
             rust_server=None,
             _get_tpe_controller=lambda: ctrl,
-            send_abort_output=lambda abort_req, req: aborted.append(req.rid),
+            send_abort_output=lambda abort_req, req: aborted.append(abort_req),
         )
-        sched._reject_tpe_generation_req = lambda req, reason: reject_fn(sched, req, reason)
+        sched._reject_tpe_generation_req = lambda req, reason, **kw: reject_fn(
+            sched, req, reason, **kw
+        )
         sched._filter_tpe_admitted_request = lambda req: filter_fn(sched, req)
 
         os.environ["SGLANG_ENABLE_TPE"] = "1"
         try:
-            # 1. CLOSED: ordinary generate rejected, control req passes through
+            # 1. CLOSED: rejected with HTTP 503 finished_reason, control req passes through
             ctrl.set_admission(tpe_state.TpeAdmissionMode.CLOSED)
             ctrl_req = _MockReq("drain", "j1", "op1", 1)
             process_fn(sched, [_FakeGenReq("r_plain"), ctrl_req])
-            self.assertEqual(aborted, ["r_plain"])
+            self.assertEqual([a.rid for a in aborted], ["r_plain"])
+            self.assertEqual(aborted[0].finished_reason["type"], "abort")
+            self.assertEqual(aborted[0].finished_reason["status_code"], 503)
             self.assertEqual(dispatched, [ctrl_req])
 
-            # 2. JOB_ONLY(j1): only matching job+gen admitted
-            dispatched.clear()
-            aborted.clear()
-            ctrl.set_admission(tpe_state.TpeAdmissionMode.JOB_ONLY, job_id="j1")
-            process_fn(
-                sched,
-                [
-                    _FakeGenReq("r_ok", extra_key="tpe:job=j1:gen=1"),
-                    _FakeGenReq("r_wrong_job", extra_key="tpe:job=j2:gen=1"),
-                    _FakeGenReq("r_wrong_gen", extra_key="tpe:job=j1:gen=2"),
-                    _FakeGenReq("r_unlabeled", extra_key=None),
-                ],
-            )
-            self.assertEqual([r.rid for r in dispatched], ["r_ok"])
-            self.assertEqual(aborted, ["r_wrong_job", "r_wrong_gen", "r_unlabeled"])
-
-            # 3. BASELINE_PROBE_ONLY: only sentinel probe admitted
+            # 2. BASELINE_PROBE_ONLY: sentinel admitted, others rejected with HTTP 409
             dispatched.clear()
             aborted.clear()
             ctrl.set_admission(tpe_state.TpeAdmissionMode.BASELINE_PROBE_ONLY)
@@ -481,15 +537,125 @@ class TestExtractedProductionBehavior(unittest.TestCase):
                 ],
             )
             self.assertEqual([r.rid for r in dispatched], ["r_sentinel"])
-            self.assertEqual(aborted, ["r_job"])
+            self.assertEqual([a.rid for a in aborted], ["r_job"])
+            self.assertEqual(aborted[0].finished_reason["status_code"], 409)
+
+            # 3. JOB_ONLY(j1) after candidate ready: only matching job+gen admitted
+            dispatched.clear()
+            aborted.clear()
+            ctrl.mark_candidate_ready("j1", "h1")
+            process_fn(
+                sched,
+                [
+                    _FakeGenReq("r_ok", extra_key="tpe:job=j1:gen=1"),
+                    _FakeGenReq("r_wrong_job", extra_key="tpe:job=j2:gen=1"),
+                    _FakeGenReq("r_wrong_gen", extra_key="tpe:job=j1:gen=2"),
+                    _FakeGenReq("r_unlabeled", extra_key=None),
+                ],
+            )
+            self.assertEqual([r.rid for r in dispatched], ["r_ok"])
+            self.assertEqual([a.rid for a in aborted], ["r_wrong_job", "r_wrong_gen", "r_unlabeled"])
+            self.assertTrue(all(a.finished_reason["status_code"] == 409 for a in aborted))
         finally:
             os.environ.pop("SGLANG_ENABLE_TPE", None)
+
+    def test_r1_r2_r3_r4_regressions(self) -> None:
+        # R1: record_baseline payload tagging & abort/token validation
+        case = record_baseline_mod.EvalCase(
+            case_id="c1", description="d", prompts=["hi"], max_new_tokens=4
+        )
+        payload = record_baseline_mod.build_generate_payload(case, instance_generation=3)
+        self.assertEqual(payload["extra_key"], "tpe:sentinel:gen=3")
+        with self.assertRaises(RuntimeError):
+            record_baseline_mod.validate_generate_results(
+                case,
+                [
+                    {
+                        "text": "",
+                        "meta_info": {
+                            "finish_reason": {"type": "abort", "message": "rejected"},
+                            "completion_tokens": 0,
+                        },
+                    }
+                ],
+            )
+
+        # R2: resolved runtime context validation
+        fn_ok = _extract_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "_validate_tpe_phase1a_runtime",
+            _make_resolved_runtime_globals(),
+        )
+        fn_ok(types.SimpleNamespace(enable_overlap=False))
+        with self.assertRaises(ValueError):
+            fn_ok(types.SimpleNamespace(enable_overlap=True))
+
+        fn_mega = _extract_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "_validate_tpe_phase1a_runtime",
+            _make_resolved_runtime_globals(enable_nvidia_megakernel=True),
+        )
+        with self.assertRaises(ValueError):
+            fn_mega(types.SimpleNamespace(enable_overlap=False))
+
+        fn_missing = _extract_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "_validate_tpe_phase1a_runtime",
+            _make_resolved_runtime_globals(graph_cfg_missing=True),
+        )
+        with self.assertRaises(ValueError):
+            fn_missing(types.SimpleNamespace(enable_overlap=False))
+
+        # R3: canary violation & exception during poll_drain -> TAINTED + success=False
+        ctrl_v = tpe_ctrl.TpeSchedulerController(instance_generation=1)
+        ctrl_v.begin_drain(op_id="d1", job_id="j1", instance_generation=1, purpose="teardown")
+        res_v = ctrl_v.poll_drain(
+            is_fully_idle_fn=lambda: True,
+            result_queue_empty_fn=lambda: True,
+            sync_streams_fn=lambda: None,
+            finalize_canary_fn=lambda: {"violations_detected": True, "canary_enabled": True},
+        )
+        assert res_v is not None
+        self.assertFalse(res_v["success"])
+        self.assertEqual(ctrl_v.state, tpe_state.TpeInstanceState.TAINTED)
+        self.assertTrue(res_v["canary_summary"]["violations_detected"])
+        self.assertIsNone(ctrl_v.drained_job_id)
+
+        ctrl_e = tpe_ctrl.TpeSchedulerController(instance_generation=1)
+        ctrl_e.begin_drain(op_id="d2", job_id="j2", instance_generation=1, purpose="teardown")
+        res_e = ctrl_e.poll_drain(
+            is_fully_idle_fn=lambda: True,
+            result_queue_empty_fn=lambda: True,
+            sync_streams_fn=lambda: (_ for _ in ()).throw(RuntimeError("cuda IMA")),
+        )
+        assert res_e is not None
+        self.assertFalse(res_e["success"])
+        self.assertEqual(ctrl_e.state, tpe_state.TpeInstanceState.TAINTED)
+
+        # R4: set_admission cannot reopen in PREPARING or overwrite active_job_id
+        ctrl_r4 = tpe_ctrl.TpeSchedulerController(instance_generation=1)
+        ctrl_r4.begin_drain(op_id="d3", job_id="j3", instance_generation=1, purpose="hot_reload")
+        ctrl_r4.poll_drain(
+            is_fully_idle_fn=lambda: True,
+            result_queue_empty_fn=lambda: True,
+            sync_streams_fn=lambda: None,
+        )
+        with self.assertRaises(RuntimeError):
+            ctrl_r4.set_admission(tpe_state.TpeAdmissionMode.JOB_ONLY, job_id="j3")
+        ctrl_r4.mark_candidate_ready("j3", "h3")
+        with self.assertRaises(RuntimeError):
+            ctrl_r4.set_admission(tpe_state.TpeAdmissionMode.JOB_ONLY, job_id="other")
+        self.assertEqual(ctrl_r4.active_job_id, "j3")
 
     def test_scheduler_handle_tpe_transaction_preconditions_and_taint_n2_n3(self) -> None:
         extra_globals = {
             "TpeTransactionReqInput": _MockReq,
             "TpeTransactionReqOutput": _MockResp,
             "current_platform": types.SimpleNamespace(synchronize=lambda: None),
+            **_make_resolved_runtime_globals(),
         }
         handle_fn = _extract_method(
             "python/sglang/srt/managers/scheduler.py",
@@ -509,12 +675,32 @@ class TestExtractedProductionBehavior(unittest.TestCase):
             "_validate_tpe_phase1a_runtime",
             extra_globals,
         )
+        snap_fn = _extract_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "_tpe_snapshot_canary_counts",
+            extra_globals,
+        )
+        fin_fn = _extract_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "_tpe_finalize_canary",
+            extra_globals,
+        )
 
         def make_sched(*, gen=2, flush_ok=True, capture_exc=None):
             ctrl = tpe_ctrl.TpeSchedulerController(instance_generation=gen)
             sent: List[_MockResp] = []
             worker_calls: List[str] = []
             hr_mgr = types.SimpleNamespace(is_candidate_active=False)
+            fake_canary = types.SimpleNamespace(
+                snapshot_kernel_run_counts=lambda: {"decode": 10},
+                finalize_job_check=lambda **kw: {
+                    "violations_detected": False,
+                    "passed_baseline": kw.get("baseline_kernel_counts"),
+                    "raise_on_violation": kw.get("raise_on_violation"),
+                },
+            )
 
             def fake_hot_reload(**kw):
                 worker_calls.append("hot_reload")
@@ -533,39 +719,28 @@ class TestExtractedProductionBehavior(unittest.TestCase):
                 return None, types.SimpleNamespace(cleanup_time_s=0.1, capture_time_s=0.2)
 
             sched = types.SimpleNamespace(
-                server_args=types.SimpleNamespace(
-                    disable_overlap_schedule=True,
-                    cuda_graph_backend_prefill="disabled",
-                    cuda_graph_backend_decode="full",
-                    enable_torch_compile=False,
-                    enable_megakernel=False,
-                    enable_monokernel=False,
-                    speculative_algorithm=None,
-                    disaggregation_mode="null",
-                    pp_size=1,
-                    ep_size=1,
-                    enable_dp_attention=False,
-                    enable_hierarchical_cache=False,
-                ),
+                enable_overlap=False,
                 tp_worker=types.SimpleNamespace(
                     model_runner=types.SimpleNamespace(
-                        canary_manager=None,
+                        canary_manager=fake_canary,
                         tpe_hot_reload_manager=hr_mgr,
                     ),
                     tpe_hot_reload=fake_hot_reload,
                     tpe_teardown=fake_teardown,
                 ),
                 _tpe_pending_drain_req=None,
+                _tpe_baseline_canary_counts=None,
                 is_fully_idle=lambda: True,
                 flush_cache=lambda: flush_ok,
                 _get_tpe_controller=lambda: ctrl,
                 _tpe_sync_streams=lambda: None,
-                _tpe_finalize_canary=lambda: {"canary_enabled": False},
                 _tpe_clear_keep_alive=lambda: None,
                 send_control_output=lambda out, req: sent.append(out),
             )
             sched._poll_tpe_drain = lambda: poll_fn(sched)
             sched._validate_tpe_phase1a_runtime = lambda: validate_fn(sched)
+            sched._tpe_snapshot_canary_counts = lambda: snap_fn(sched)
+            sched._tpe_finalize_canary = lambda: fin_fn(sched)
             return sched, ctrl, sent, worker_calls
 
         os.environ["SGLANG_ENABLE_TPE"] = "1"

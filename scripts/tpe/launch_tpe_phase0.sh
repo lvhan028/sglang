@@ -35,6 +35,7 @@ exec python3 -m sglang.launch_server \
   --port "${PORT}" \
   --tp-size 1 \
   --disable-overlap-schedule \
+  --skip-server-warmup \
   --cuda-graph-backend-prefill disabled \
   --cuda-graph-bs 1 4 8 16 \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \

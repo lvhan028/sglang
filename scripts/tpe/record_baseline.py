@@ -113,8 +113,10 @@ def write_cases_jsonl(cases: List[EvalCase], path: str) -> str:
     return h.hexdigest()
 
 
-def _post_generate(base_url: str, case: EvalCase) -> List[Dict[str, Any]]:
-    payload = {
+def build_generate_payload(
+    case: EvalCase, *, instance_generation: int = 0
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
         "text": case.prompts,
         "sampling_params": {
             "temperature": case.temperature,
@@ -124,6 +126,44 @@ def _post_generate(base_url: str, case: EvalCase) -> List[Dict[str, Any]]:
         "return_logprob": True,
         "top_logprobs_num": 5,
     }
+    if instance_generation > 0:
+        payload["extra_key"] = f"tpe:sentinel:gen={instance_generation}"
+    return payload
+
+
+def validate_generate_results(
+    case: EvalCase, results: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    if len(results) != len(case.prompts):
+        raise RuntimeError(
+            f"Case {case.case_id}: expected {len(case.prompts)} results, got {len(results)}"
+        )
+    for idx, item in enumerate(results):
+        if "error" in item:
+            raise RuntimeError(f"Case {case.case_id}[{idx}] error: {item['error']}")
+        meta_info = item.get("meta_info") or {}
+        finish_reason = meta_info.get("finish_reason") or {}
+        if finish_reason.get("type") == "abort":
+            raise RuntimeError(
+                f"Case {case.case_id}[{idx}] aborted: {finish_reason}"
+            )
+        completion_tokens = meta_info.get("completion_tokens")
+        if (
+            case.ignore_eos
+            and completion_tokens is not None
+            and int(completion_tokens) != case.max_new_tokens
+        ):
+            raise RuntimeError(
+                f"Case {case.case_id}[{idx}] completion_tokens={completion_tokens} "
+                f"!= expected {case.max_new_tokens}"
+            )
+    return results
+
+
+def _post_generate(
+    base_url: str, case: EvalCase, *, instance_generation: int = 0
+) -> List[Dict[str, Any]]:
+    payload = build_generate_payload(case, instance_generation=instance_generation)
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/generate",
         data=json.dumps(payload).encode("utf-8"),
@@ -131,8 +171,11 @@ def _post_generate(base_url: str, case: EvalCase) -> List[Dict[str, Any]]:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=300) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} for case {case.case_id}")
         data = json.loads(resp.read().decode("utf-8"))
-    return data if isinstance(data, list) else [data]
+    results = data if isinstance(data, list) else [data]
+    return validate_generate_results(case, results)
 
 
 def main() -> int:
@@ -142,6 +185,12 @@ def main() -> int:
         "--base-url",
         default="",
         help="Optional running SGLang server URL (if omitted, only generates JSONL datasets)",
+    )
+    parser.add_argument(
+        "--instance-generation",
+        type=int,
+        default=0,
+        help="TPE instance generation (>0 attaches extra_key=tpe:sentinel:gen=<N>; 0 omits it for non-TPE servers)",
     )
     args = parser.parse_args()
 
@@ -159,13 +208,29 @@ def main() -> int:
         "sentinel_cases_sha256": sentinel_sha,
         "num_eval_cases": len(eval_cases),
         "num_sentinel_cases": len(sentinel_cases),
+        "instance_generation": args.instance_generation,
     }
 
     if args.base_url:
-        eval_ref = {c.case_id: _post_generate(args.base_url, c) for c in eval_cases}
-        sentinel_ref = {c.case_id: _post_generate(args.base_url, c) for c in sentinel_cases}
-        # Self-comparison pass to measure native baseline reproducibility
-        eval_pass2 = {c.case_id: _post_generate(args.base_url, c) for c in eval_cases}
+        eval_ref = {
+            c.case_id: _post_generate(
+                args.base_url, c, instance_generation=args.instance_generation
+            )
+            for c in eval_cases
+        }
+        sentinel_ref = {
+            c.case_id: _post_generate(
+                args.base_url, c, instance_generation=args.instance_generation
+            )
+            for c in sentinel_cases
+        }
+        # Self-comparison pass to measure native baseline text reproducibility
+        eval_pass2 = {
+            c.case_id: _post_generate(
+                args.base_url, c, instance_generation=args.instance_generation
+            )
+            for c in eval_cases
+        }
         exact_matches = sum(
             1
             for cid in eval_ref

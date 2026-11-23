@@ -51,10 +51,8 @@ class TpeGraphAdapter:
         self.model_runner.decode_cuda_graph_runner = None
         self.model_runner.decode_cuda_graph_captured = False
 
-        # Preserve full borrow-pool lifecycle rather than only clearing the global handle.
-        reset_borrow = getattr(graph_pool_utils, "reset_graph_pool_borrow_state", None)
-        if callable(reset_borrow):
-            reset_borrow()
+        # Clear global graph memory pool; borrow-pool retirement is handled by
+        # `graph_pool_capture_scope` inside the full-backend recapture path.
         set_global_graph_memory_pool(None)
         gc.collect()
         current_platform.empty_cache()

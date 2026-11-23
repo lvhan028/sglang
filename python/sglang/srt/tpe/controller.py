@@ -29,7 +29,7 @@ def parse_tpe_admission_key(
 ) -> Tuple[Optional[str], Optional[int], bool]:
     """Parse TPE lease metadata carried in `GenerateReqInput.extra_key`.
 
-    Supported formats:
+    Supported formats (Phase 1a with `--disable-radix-cache`):
       - ``"tpe:job=<job_id>:gen=<generation>"`` -> ``(job_id, generation, False)``
       - ``"tpe:sentinel:gen=<generation>"``     -> ``(None, generation, True)``
       - anything else / None                    -> ``(None, None, False)``
@@ -103,11 +103,15 @@ class TpeSchedulerController:
     def assert_ready_for_hot_reload(
         self, *, job_id: str, instance_generation: int
     ) -> None:
-        """Require completed pre-install drain for this exact job and generation (N2)."""
+        """Require completed pre-install drain and CLOSED admission for this job (N2, R4)."""
         self.assert_generation_and_healthy(instance_generation)
         if self.state != TpeInstanceState.PREPARING:
             raise RuntimeError(
                 f"hot_reload requires state=PREPARING (completed drain), got {self.state.value}"
+            )
+        if self.admission_mode != TpeAdmissionMode.CLOSED:
+            raise RuntimeError(
+                f"hot_reload requires admission_mode=CLOSED, got {self.admission_mode.value}"
             )
         if self.drained_purpose != "hot_reload" or self.drained_job_id != job_id:
             raise RuntimeError(
@@ -118,11 +122,15 @@ class TpeSchedulerController:
     def assert_ready_for_teardown(
         self, *, job_id: str, instance_generation: int
     ) -> None:
-        """Require completed pre-teardown drain for the active job and generation (N2)."""
+        """Require completed pre-teardown drain and CLOSED admission for the active job (N2, R4)."""
         self.assert_generation_and_healthy(instance_generation)
         if self.state != TpeInstanceState.RESTORING:
             raise RuntimeError(
                 f"teardown requires state=RESTORING (completed drain), got {self.state.value}"
+            )
+        if self.admission_mode != TpeAdmissionMode.CLOSED:
+            raise RuntimeError(
+                f"teardown requires admission_mode=CLOSED, got {self.admission_mode.value}"
             )
         if self.drained_purpose != "teardown" or self.drained_job_id != job_id:
             raise RuntimeError(
@@ -141,17 +149,47 @@ class TpeSchedulerController:
         job_id: Optional[str] = None,
         instance_generation: Optional[int] = None,
     ) -> None:
+        """Update admission mode while preserving drain & active-candidate invariants (R4)."""
         if instance_generation is not None:
             self.assert_generation_and_healthy(instance_generation)
         elif self.state in (TpeInstanceState.TAINTED, TpeInstanceState.RESTARTING):
             raise RuntimeError(
                 f"Instance is {self.state.value}: {self.taint_reason or 'restart required'}"
             )
-        self.admission_mode = mode
+
+        # Never allow reopening admission while draining or holding a completed drain barrier.
+        if mode != TpeAdmissionMode.CLOSED and self.state in (
+            TpeInstanceState.DRAINING,
+            TpeInstanceState.PREPARING,
+            TpeInstanceState.RESTORING,
+        ):
+            raise RuntimeError(
+                f"Cannot open admission ({mode.value}) in state {self.state.value}; "
+                "complete the pending hot_reload/teardown first."
+            )
+
         if mode == TpeAdmissionMode.JOB_ONLY:
-            if job_id is None:
-                raise ValueError("JOB_ONLY admission requires job_id")
-            self.active_job_id = job_id
+            if self.state not in (
+                TpeInstanceState.CANDIDATE_READY,
+                TpeInstanceState.EVALUATING,
+            ):
+                raise RuntimeError(
+                    f"JOB_ONLY admission requires CANDIDATE_READY/EVALUATING, got {self.state.value}"
+                )
+            if job_id is None or self.active_job_id is None or job_id != self.active_job_id:
+                raise RuntimeError(
+                    f"JOB_ONLY admission job mismatch: active={self.active_job_id!r}, requested={job_id!r}"
+                )
+        elif mode == TpeAdmissionMode.BASELINE_PROBE_ONLY:
+            if self.state not in (
+                TpeInstanceState.BASELINE_READY,
+                TpeInstanceState.BASELINE_VERIFYING,
+            ):
+                raise RuntimeError(
+                    f"BASELINE_PROBE_ONLY admission requires BASELINE_READY/BASELINE_VERIFYING, got {self.state.value}"
+                )
+
+        self.admission_mode = mode
 
     def can_admit_request(
         self,
@@ -224,7 +262,7 @@ class TpeSchedulerController:
         """Non-blocking tick called from the scheduler event loop.
 
         Returns a completion dict once quiescence + ordered cleanup finishes
-        (or on timeout), else None while still draining.
+        (or on timeout/canary violation/sync exception), else None while still draining.
         """
         drain = self.pending_drain
         if drain is None:
@@ -243,24 +281,62 @@ class TpeSchedulerController:
                 "responder_id": self.responder_id,
                 "state": self.state.value,
                 "elapsed_s": now - drain.started_monotonic,
+                "canary_summary": None,
                 "error_message": self.taint_reason,
             }
 
         if not (is_fully_idle_fn() and result_queue_empty_fn()):
             return None
 
-        # Strict F3 ordering:
-        # 1. Synchronize all GPU streams BEFORE touching canary or releasing keep-alive refs.
-        sync_streams_fn()
-
-        # 2. If draining for teardown, finalize kv_canary BEFORE cache flush / ref release.
         canary_summary: Optional[Dict[str, object]] = None
-        if drain.purpose == "teardown" and finalize_canary_fn is not None:
-            canary_summary = finalize_canary_fn()
+        try:
+            # Strict F3 ordering:
+            # 1. Synchronize all GPU streams BEFORE touching canary or releasing keep-alive refs.
+            sync_streams_fn()
 
-        # 3. Release overlap keep-alive refs (batch_record_buf) only AFTER GPU sync.
-        if clear_keep_alive_fn is not None:
-            clear_keep_alive_fn()
+            # 2. If draining for teardown, finalize kv_canary BEFORE cache flush / ref release.
+            if drain.purpose == "teardown" and finalize_canary_fn is not None:
+                canary_summary = finalize_canary_fn()
+                if bool(canary_summary.get("violations_detected", False)):
+                    self.pending_drain = None
+                    self.mark_tainted(
+                        f"kv_canary violation detected during teardown drain (job={drain.job_id})"
+                    )
+                    return {
+                        "success": False,
+                        "op": "drain",
+                        "op_id": drain.op_id,
+                        "job_id": drain.job_id,
+                        "instance_generation": drain.instance_generation,
+                        "responder_id": self.responder_id,
+                        "state": self.state.value,
+                        "elapsed_s": self._clock() - drain.started_monotonic,
+                        "canary_summary": canary_summary,
+                        "error_message": self.taint_reason,
+                    }
+
+            # 3. Release overlap keep-alive refs (batch_record_buf) only AFTER GPU sync.
+            if clear_keep_alive_fn is not None:
+                clear_keep_alive_fn()
+        except Exception as exc:
+            # Catch sync / sweep / violation check exceptions even during deferred event-loop polling (R3).
+            self.pending_drain = None
+            self.mark_tainted(
+                f"Drain finalization failed for {drain.purpose} (job={drain.job_id}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return {
+                "success": False,
+                "op": "drain",
+                "op_id": drain.op_id,
+                "job_id": drain.job_id,
+                "instance_generation": drain.instance_generation,
+                "responder_id": self.responder_id,
+                "state": self.state.value,
+                "elapsed_s": self._clock() - drain.started_monotonic,
+                "canary_summary": canary_summary,
+                "error_message": self.taint_reason,
+            }
 
         self.pending_drain = None
         self.drained_job_id = drain.job_id

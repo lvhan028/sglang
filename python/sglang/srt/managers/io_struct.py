@@ -2623,6 +2623,8 @@ class TpeTransactionReqInput(BaseReq, kw_only=True):
         "teardown",
         "set_admission",
         "complete_baseline_verifying",
+        "configure_logits_capture",
+        "finalize_logits_capture",
     ]
     op_id: str
     job_id: str
@@ -2634,6 +2636,12 @@ class TpeTransactionReqInput(BaseReq, kw_only=True):
     drain_purpose: Optional[Literal["hot_reload", "teardown"]] = None
     admission_mode: Optional[Literal["CLOSED", "JOB_ONLY", "BASELINE_PROBE_ONLY"]] = None
     sentinel_passed: Optional[bool] = None
+    capture_logits_enabled: Optional[bool] = None
+    capture_steps: Optional[List[int]] = None
+    logits_save_path: Optional[str] = None
+    logits_ref_path: Optional[str] = None
+    max_abs_diff_threshold: float = 5e-2
+    min_cosine_similarity: float = 0.999
     timeout_s: float = 30.0
 
 
@@ -2650,6 +2658,7 @@ class TpeTransactionReqOutput(BaseReq, kw_only=True):
     artifact_hash: Optional[str] = None
     phase_timings_s: Dict[str, float] = msgspec.field(default_factory=dict)
     canary_summary: Optional[Dict[str, Any]] = None
+    logits_summary: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
 
 

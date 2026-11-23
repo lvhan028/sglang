@@ -36,7 +36,6 @@ class TpeGraphAdapter:
     def destroy_decode_graphs(self) -> float:
         """Destroy existing decode CUDA graphs and reset global graph/borrow pools."""
         from sglang.srt.model_executor.runner import set_global_graph_memory_pool
-        from sglang.srt.model_executor.runner_utils import pool as graph_pool_utils
         from sglang.srt.platforms import current_platform
 
         tic = time.perf_counter()

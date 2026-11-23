@@ -111,6 +111,10 @@ tpe_graph_adapter = _load_module_direct(
     "sglang.srt.model_executor.model_runner_components.tpe_graph_adapter",
     "python/sglang/srt/model_executor/model_runner_components/tpe_graph_adapter.py",
 )
+tpe_logits_obs = _load_module_direct(
+    "sglang.srt.tpe.logits_observer",
+    "python/sglang/srt/tpe/logits_observer.py",
+)
 record_baseline_mod = _load_module_direct(
     "tpe_record_baseline", "scripts/tpe/record_baseline.py"
 )
@@ -276,6 +280,12 @@ class _MockReq:
     drain_purpose: Optional[str] = None
     admission_mode: Optional[str] = None
     sentinel_passed: Optional[bool] = None
+    capture_logits_enabled: Optional[bool] = None
+    capture_steps: Optional[List[int]] = None
+    logits_save_path: Optional[str] = None
+    logits_ref_path: Optional[str] = None
+    max_abs_diff_threshold: float = 5e-2
+    min_cosine_similarity: float = 0.999
     timeout_s: float = 10.0
 
 
@@ -292,6 +302,7 @@ class _MockResp:
     artifact_hash: Optional[str] = None
     phase_timings_s: Optional[Dict[str, float]] = None
     canary_summary: Optional[Dict[str, Any]] = None
+    logits_summary: Optional[Dict[str, Any]] = None
 
 
 class TestTpeCommunicator(unittest.TestCase):
@@ -376,6 +387,8 @@ class TestExtractedProductionBehavior(unittest.TestCase):
                     model=_DummyModel(),
                     server_args=None,
                     _token_oracle_manager=None,
+                    sampling_observer=None,
+                    supports_sampling_observer=lambda: True,
                     init_kv_index_translator=lambda: calls.append("init_kv_index_translator"),
                     init_ngram_embedding_manager=lambda: calls.append("init_ngram_embedding_manager"),
                     maybe_init_watermark_state=lambda: calls.append("maybe_init_watermark_state"),
@@ -556,6 +569,27 @@ class TestExtractedProductionBehavior(unittest.TestCase):
             self.assertEqual([r.rid for r in dispatched], ["r_ok"])
             self.assertEqual([a.rid for a in aborted], ["r_wrong_job", "r_wrong_gen", "r_unlabeled"])
             self.assertTrue(all(a.finished_reason["status_code"] == 409 for a in aborted))
+
+            # 4. N6: when logits capture is armed, non-neutral sampling rejected BEFORE enqueue with HTTP 400
+            dispatched.clear()
+            aborted.clear()
+            col_live = tpe_logits_obs.TpeLogitsCollector()
+            col_live.arm(capture_steps=[0], owner_job_id="j1", owner_generation=1)
+            sched.tp_worker = types.SimpleNamespace(
+                model_runner=types.SimpleNamespace(tpe_logits_collector=col_live)
+            )
+            r_non_neutral = _FakeGenReq("r_pen", extra_key="tpe:job=j1:gen=1")
+            r_non_neutral.sampling_params = types.SimpleNamespace(
+                repetition_penalty=1.5, frequency_penalty=0.0, presence_penalty=0.0, min_new_tokens=0
+            )
+            r_neutral = _FakeGenReq("r_neut", extra_key="tpe:job=j1:gen=1")
+            r_neutral.sampling_params = types.SimpleNamespace(
+                repetition_penalty=1.0, frequency_penalty=0.0, presence_penalty=0.0, min_new_tokens=0
+            )
+            process_fn(sched, [r_non_neutral, r_neutral])
+            self.assertEqual([r.rid for r in dispatched], ["r_neut"])
+            self.assertEqual([a.rid for a in aborted], ["r_pen"])
+            self.assertEqual(aborted[0].finished_reason["status_code"], 400)
         finally:
             os.environ.pop("SGLANG_ENABLE_TPE", None)
 
@@ -856,7 +890,347 @@ class TestHotReloadAndFixtures(unittest.TestCase):
             self.assertEqual(canary_hits, 3)
 
 
-class TestLogitsVerifierAndRepoLintContracts(unittest.TestCase):
+class TestLogitsObserverAndRepoLintContracts(unittest.TestCase):
+    def test_sampling_observer_clones_and_verifies_full_vocab_logits(self) -> None:
+        collector = tpe_logits_obs.TpeLogitsCollector()
+        observer = tpe_logits_obs.TpeLogitsObserver(collector)
+
+        # Inactive by default -> zero work during throughput benchmarking
+        self.assertFalse(observer.is_active(None))
+        self.assertIsNone(observer.before_grammar([[1.0, 2.0]], None))
+
+        batch = types.SimpleNamespace(reqs=[types.SimpleNamespace(rid="req_a")])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ref_path = os.path.join(tmpdir, "baseline_logits.json")
+
+            # 1. Record baseline steps 0 and 1 (verify clone protects against buffer overwrite)
+            collector.arm(capture_steps=[0, 1])
+            self.assertTrue(observer.is_active(None))
+
+            buf0 = [[1.0, 2.5, -0.5, 4.0]]
+            state0 = observer.before_grammar(buf0, None)
+            buf0[0][0] = 999.0  # simulate graph static buffer overwrite
+            dev0 = observer.after_sample(state0, [3])
+            assert dev0 is not None
+            host0 = dev0.copy_to_host(lambda x: x)
+            host0.consume(batch, [types.SimpleNamespace(output_index=0, token_ids=(3,))])
+
+            state1 = observer.before_grammar([[0.5, 3.0, 1.0, -1.0]], None)
+            dev1 = observer.after_sample(state1, [1])
+            assert dev1 is not None
+            dev1.copy_to_host(lambda x: x).consume(
+                batch, [types.SimpleNamespace(output_index=1, token_ids=(1,))]
+            )
+
+            # Step 2 not in capture_steps -> ignored
+            state2 = observer.before_grammar([[9.0, 9.0, 9.0, 9.0]], None)
+            dev2 = observer.after_sample(state2, [0])
+            assert dev2 is not None
+            dev2.copy_to_host(lambda x: x).consume(
+                batch, [types.SimpleNamespace(output_index=2, token_ids=(0,))]
+            )
+
+            collector.disarm()
+            meta = collector.save_reference(ref_path)
+            self.assertEqual(meta["num_requests"], 1)
+            self.assertEqual(meta["num_positions"], 2)
+            self.assertEqual(meta["vocab_size"], 4)
+
+            # 2. Matching candidate -> PASS
+            collector.arm(capture_steps=[0, 1])
+            collector.record_step(
+                rid="req_a", output_step=0, token_id=3, logits_row=[1.001, 2.5, -0.5, 3.999]
+            )
+            collector.record_step(
+                rid="req_a", output_step=1, token_id=1, logits_row=[0.5, 3.001, 1.0, -1.0]
+            )
+            report_ok = collector.compare_against_reference(ref_path)
+            self.assertTrue(report_ok["passed"])
+            self.assertEqual(report_ok["num_checked"], 2)
+            self.assertEqual(report_ok["trajectory_divergences"], 0)
+
+            # 3. Perturbed logits -> FAIL (max_abs_diff_exceeded)
+            collector.arm(capture_steps=[0, 1])
+            collector.record_step(
+                rid="req_a", output_step=0, token_id=3, logits_row=[1.0, 2.5, -0.5, 5.5]
+            )
+            collector.record_step(
+                rid="req_a", output_step=1, token_id=1, logits_row=[0.5, 3.0, 1.0, -1.0]
+            )
+            report_bad = collector.compare_against_reference(ref_path)
+            self.assertFalse(report_bad["passed"])
+            self.assertEqual(report_bad["num_failed"], 1)
+
+            # 4. Token trajectory divergence at step 0 -> step 1 flagged as trajectory_diverged
+            collector.arm(capture_steps=[0, 1])
+            collector.record_step(
+                rid="req_a", output_step=0, token_id=2, logits_row=[1.0, 2.5, -0.5, 4.0]
+            )
+            collector.record_step(
+                rid="req_a", output_step=1, token_id=1, logits_row=[0.5, 3.0, 1.0, -1.0]
+            )
+            report_div = collector.compare_against_reference(ref_path)
+            self.assertFalse(report_div["passed"])
+            self.assertEqual(report_div["trajectory_divergences"], 1)
+
+    def test_round4_n1_to_n6_regressions(self) -> None:
+        # N2: tpe_graph_adapter no longer imports unused graph_pool_utils
+        with open(
+            os.path.join(
+                REPO_ROOT,
+                "python/sglang/srt/model_executor/model_runner_components/tpe_graph_adapter.py",
+            ),
+            "r",
+            encoding="utf-8",
+        ) as f:
+            self.assertNotIn("graph_pool_utils", f.read())
+
+        # N6a: request-level neutral sampling check before enqueue
+        self.assertIsNotNone(
+            tpe_logits_obs.check_neutral_sampling_params(
+                types.SimpleNamespace(repetition_penalty=1.2, frequency_penalty=0.0, presence_penalty=0.0, min_new_tokens=0)
+            )
+        )
+        self.assertIsNone(
+            tpe_logits_obs.check_neutral_sampling_params(
+                types.SimpleNamespace(repetition_penalty=1.0, frequency_penalty=0.0, presence_penalty=0.0, min_new_tokens=0)
+            )
+        )
+
+        # N6b: defensive before_grammar guard NEVER crashes scheduler; marks violation & fails save/compare
+        collector = tpe_logits_obs.TpeLogitsCollector()
+        observer = tpe_logits_obs.TpeLogitsObserver(collector)
+        collector.arm(capture_steps=[0])
+        bad_sampling = types.SimpleNamespace(
+            penalizer_orchestrator=types.SimpleNamespace(is_required=True),
+            has_custom_logit_processor=False,
+        )
+        self.assertIsNone(observer.before_grammar([[1.0, 2.0]], bad_sampling))
+        with self.assertRaises(ValueError):
+            collector.save_reference("/tmp/should_not_write.json")
+
+        # N5: ownership persists across disarm() until finalize/clear
+        col_n5 = tpe_logits_obs.TpeLogitsCollector()
+        col_n5.arm(capture_steps=[0], owner_job_id="baseline_1", owner_generation=1)
+        col_n5.record_step(rid="r1", output_step=0, token_id=7, logits_row=[1.0, 2.0])
+        col_n5.disarm()
+        with self.assertRaises(RuntimeError):
+            col_n5.arm(capture_steps=[0], owner_job_id="baseline_2", owner_generation=1)
+        self.assertEqual(col_n5.summary()["num_positions"], 1)
+        col_n5.clear()
+        col_n5.arm(capture_steps=[0], owner_job_id="baseline_2", owner_generation=1)
+
+        # N3: sparse capture [0, 2] catches divergence at UNCAPTURED step 1 and prompt digest mismatch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sparse_ref = os.path.join(tmpdir, "sparse_ref.json")
+            collector.arm(capture_steps=[0, 2])
+            for step, tok, row in (
+                (0, 1, [1.0, 2.0]),
+                (1, 5, [3.0, 4.0]),
+                (2, 3, [5.0, 6.0]),
+            ):
+                collector.record_step(
+                    rid="r1",
+                    output_step=step,
+                    token_id=tok,
+                    logits_row=row,
+                    input_digest="digest_prompt_A",
+                )
+            collector.save_reference(sparse_ref)
+
+            # Candidate diverges at uncaptured step 1 (tok=6 vs 5), even with identical logits at [0, 2]
+            collector.arm(capture_steps=[0, 2])
+            for step, tok, row in (
+                (0, 1, [1.0, 2.0]),
+                (1, 6, [3.0, 4.0]),
+                (2, 3, [5.0, 6.0]),
+            ):
+                collector.record_step(
+                    rid="r1",
+                    output_step=step,
+                    token_id=tok,
+                    logits_row=row,
+                    input_digest="digest_prompt_A",
+                )
+            rep_sparse = collector.compare_against_reference(sparse_ref)
+            self.assertFalse(rep_sparse["passed"])
+            self.assertEqual(rep_sparse["trajectory_divergences"], 1)
+
+            # Candidate with mismatched input prompt digest -> FAIL
+            collector.arm(capture_steps=[0, 2])
+            for step, tok, row in (
+                (0, 1, [1.0, 2.0]),
+                (1, 5, [3.0, 4.0]),
+                (2, 3, [5.0, 6.0]),
+            ):
+                collector.record_step(
+                    rid="r1",
+                    output_step=step,
+                    token_id=tok,
+                    logits_row=row,
+                    input_digest="digest_prompt_B",
+                )
+            rep_prompt = collector.compare_against_reference(sparse_ref)
+            self.assertFalse(rep_prompt["passed"])
+            self.assertEqual(
+                rep_prompt["failures"][0]["reason"], "input_prompt_digest_mismatch"
+            )
+
+            # N1, N4, N5 via real extracted Scheduler.handle_tpe_transaction()
+            extra_globals = {
+                "TpeTransactionReqInput": _MockReq,
+                "TpeTransactionReqOutput": _MockResp,
+                "current_platform": types.SimpleNamespace(synchronize=lambda: None),
+                **_make_resolved_runtime_globals(),
+            }
+            handle_fn = _extract_method(
+                "python/sglang/srt/managers/scheduler.py",
+                "Scheduler",
+                "handle_tpe_transaction",
+                extra_globals,
+            )
+            poll_fn = _extract_method(
+                "python/sglang/srt/managers/scheduler.py",
+                "Scheduler",
+                "_poll_tpe_drain",
+                extra_globals,
+            )
+            validate_fn = _extract_method(
+                "python/sglang/srt/managers/scheduler.py",
+                "Scheduler",
+                "_validate_tpe_phase1a_runtime",
+                extra_globals,
+            )
+
+            # N1: canary snapshot failure after candidate activation marks TAINTED + CLOSED
+            ctrl_n1 = tpe_ctrl.TpeSchedulerController(instance_generation=1)
+            sent_n1: List[_MockResp] = []
+            hr_mgr = types.SimpleNamespace(is_candidate_active=False)
+
+            def ok_hr(**kw):
+                hr_mgr.is_candidate_active = True
+                return (
+                    types.SimpleNamespace(artifact_hash="h1"),
+                    types.SimpleNamespace(cleanup_time_s=0.1, capture_time_s=0.1),
+                )
+
+            sched_n1 = types.SimpleNamespace(
+                enable_overlap=False,
+                tp_worker=types.SimpleNamespace(
+                    model_runner=types.SimpleNamespace(
+                        canary_manager=None,
+                        tpe_hot_reload_manager=hr_mgr,
+                        tpe_logits_collector=collector,
+                    ),
+                    tpe_hot_reload=ok_hr,
+                ),
+                _tpe_pending_drain_req=None,
+                is_fully_idle=lambda: True,
+                _get_tpe_controller=lambda: ctrl_n1,
+                _tpe_sync_streams=lambda: None,
+                _tpe_finalize_canary=lambda: {"violations_detected": False},
+                _tpe_clear_keep_alive=lambda: None,
+                _tpe_snapshot_canary_counts=lambda: (_ for _ in ()).throw(
+                    RuntimeError("gpu counter copy failed")
+                ),
+                send_control_output=lambda out, req: sent_n1.append(out),
+            )
+            sched_n1._poll_tpe_drain = lambda: poll_fn(sched_n1)
+            sched_n1._validate_tpe_phase1a_runtime = lambda: validate_fn(sched_n1)
+
+            os.environ["SGLANG_ENABLE_TPE"] = "1"
+            try:
+                handle_fn(
+                    sched_n1,
+                    _MockReq("drain", "j1", "d1", 1, drain_purpose="hot_reload"),
+                )
+                handle_fn(
+                    sched_n1,
+                    _MockReq("hot_reload", "j1", "hr1", 1, code_utf8="def forward(*a): pass"),
+                )
+                self.assertFalse(sent_n1[-1].success)
+                self.assertEqual(ctrl_n1.state, tpe_state.TpeInstanceState.TAINTED)
+                self.assertEqual(ctrl_n1.admission_mode, tpe_state.TpeAdmissionMode.CLOSED)
+
+                # N4 & N5: same save/ref path rejected without overwriting ref; wrong job rejected
+                ctrl_n45 = tpe_ctrl.TpeSchedulerController(instance_generation=1)
+                ctrl_n45.mark_candidate_ready("jA", "hA")
+                col2 = tpe_logits_obs.TpeLogitsCollector()
+                sent_n45: List[_MockResp] = []
+                sched_n45 = types.SimpleNamespace(
+                    enable_overlap=False,
+                    tp_worker=types.SimpleNamespace(
+                        model_runner=types.SimpleNamespace(tpe_logits_collector=col2),
+                    ),
+                    _tpe_pending_drain_req=None,
+                    is_fully_idle=lambda: True,
+                    _get_tpe_controller=lambda: ctrl_n45,
+                    send_control_output=lambda out, req: sent_n45.append(out),
+                )
+                sched_n45._validate_tpe_phase1a_runtime = lambda: validate_fn(sched_n45)
+
+                handle_fn(
+                    sched_n45,
+                    _MockReq(
+                        "configure_logits_capture",
+                        "jA",
+                        "c1",
+                        1,
+                        capture_logits_enabled=True,
+                        capture_steps=[0],
+                    ),
+                )
+                self.assertTrue(sent_n45[-1].success)
+                col2.record_step(rid="r1", output_step=0, token_id=1, logits_row=[100.0, 200.0])
+
+                # N5: wrong job jB cannot re-arm or finalize jA's capture
+                handle_fn(
+                    sched_n45,
+                    _MockReq(
+                        "configure_logits_capture",
+                        "jB",
+                        "c2",
+                        1,
+                        capture_logits_enabled=True,
+                    ),
+                )
+                self.assertFalse(sent_n45[-1].success)
+                self.assertEqual(col2.summary()["num_positions"], 1)
+
+                handle_fn(
+                    sched_n45,
+                    _MockReq(
+                        "finalize_logits_capture",
+                        "jB",
+                        "f1",
+                        1,
+                        logits_ref_path=sparse_ref,
+                    ),
+                )
+                self.assertFalse(sent_n45[-1].success)
+                self.assertEqual(col2.summary()["num_positions"], 1)
+
+                # N4: specifying both save_path and ref_path fails and preserves original ref file
+                with open(sparse_ref, "r", encoding="utf-8") as f:
+                    orig_ref_text = f.read()
+                handle_fn(
+                    sched_n45,
+                    _MockReq(
+                        "finalize_logits_capture",
+                        "jA",
+                        "f2",
+                        1,
+                        logits_save_path=sparse_ref,
+                        logits_ref_path=sparse_ref,
+                    ),
+                )
+                self.assertFalse(sent_n45[-1].success)
+                with open(sparse_ref, "r", encoding="utf-8") as f:
+                    self.assertEqual(f.read(), orig_ref_text)
+            finally:
+                os.environ.pop("SGLANG_ENABLE_TPE", None)
+
     def test_logits_verifier(self) -> None:
         self.assertTrue(
             tpe_logits.verify_logits_pair([1.0, 2.0, 3.0], [1.001, 2.0, 2.999]).passed
@@ -875,6 +1249,7 @@ class TestLogitsVerifierAndRepoLintContracts(unittest.TestCase):
             "python/sglang/srt/tpe/state.py",
             "python/sglang/srt/tpe/communicator.py",
             "python/sglang/srt/tpe/controller.py",
+            "python/sglang/srt/tpe/logits_observer.py",
             "python/sglang/srt/tpe/logits_verifier.py",
             "python/sglang/srt/model_executor/model_runner_components/hot_reload.py",
             "python/sglang/srt/model_executor/model_runner_components/tpe_graph_adapter.py",

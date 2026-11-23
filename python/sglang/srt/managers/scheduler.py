@@ -6283,8 +6283,9 @@ class Scheduler(
         self.send_abort_output(abort_req, tokenized_req)
 
     def _filter_tpe_admitted_request(self, recv_req):
-        """Enforce TPE admission control on incoming generation requests (N1, R1)."""
+        """Enforce TPE admission control and neutral sampling when logits capture is armed (N1, R1, N6)."""
         from sglang.srt.tpe.controller import parse_tpe_admission_key
+        from sglang.srt.tpe.logits_observer import check_neutral_sampling_params
         from sglang.srt.tpe.state import TpeAdmissionMode, TpeInstanceState
 
         def _reject_status(ctrl) -> int:
@@ -6295,10 +6296,15 @@ class Scheduler(
                 return 503
             return 409
 
-        if isinstance(recv_req, TokenizedGenerateReqInput):
-            ctrl = self._get_tpe_controller()
+        def _logits_capture_armed() -> bool:
+            tp_worker = getattr(self, "tp_worker", None)
+            mr = getattr(tp_worker, "model_runner", None) if tp_worker is not None else None
+            collector = getattr(mr, "tpe_logits_collector", None) if mr is not None else None
+            return bool(collector is not None and getattr(collector, "enabled", False))
+
+        def _admit_single(ctrl, sub_req) -> bool:
             job_id, gen, is_probe = parse_tpe_admission_key(
-                getattr(recv_req, "extra_key", None)
+                getattr(sub_req, "extra_key", None)
             )
             if not ctrl.can_admit_request(
                 req_job_id=job_id,
@@ -6306,31 +6312,31 @@ class Scheduler(
                 is_baseline_probe=is_probe,
             ):
                 self._reject_tpe_generation_req(
-                    recv_req,
+                    sub_req,
                     f"TPE admission rejected (mode={ctrl.admission_mode.value}, state={ctrl.state.value})",
                     status_code=_reject_status(ctrl),
                 )
-                return None
-            return recv_req
-        if isinstance(recv_req, BatchTokenizedGenerateReqInput):
-            ctrl = self._get_tpe_controller()
-            admitted = []
-            for sub_req in recv_req.batch:
-                job_id, gen, is_probe = parse_tpe_admission_key(
-                    getattr(sub_req, "extra_key", None)
+                return False
+            if _logits_capture_armed():
+                sampling_err = check_neutral_sampling_params(
+                    getattr(sub_req, "sampling_params", None),
+                    custom_logit_processor=getattr(sub_req, "custom_logit_processor", None),
                 )
-                if ctrl.can_admit_request(
-                    req_job_id=job_id,
-                    req_generation=gen,
-                    is_baseline_probe=is_probe,
-                ):
-                    admitted.append(sub_req)
-                else:
+                if sampling_err is not None:
                     self._reject_tpe_generation_req(
                         sub_req,
-                        f"TPE admission rejected (mode={ctrl.admission_mode.value}, state={ctrl.state.value})",
-                        status_code=_reject_status(ctrl),
+                        sampling_err,
+                        status_code=400,
                     )
+                    return False
+            return True
+
+        if isinstance(recv_req, TokenizedGenerateReqInput):
+            ctrl = self._get_tpe_controller()
+            return recv_req if _admit_single(ctrl, recv_req) else None
+        if isinstance(recv_req, BatchTokenizedGenerateReqInput):
+            ctrl = self._get_tpe_controller()
+            admitted = [sub_req for sub_req in recv_req.batch if _admit_single(ctrl, sub_req)]
             if not admitted:
                 return None
             recv_req.batch = admitted
@@ -6476,11 +6482,13 @@ class Scheduler(
                         artifact_hash=recv_req.artifact_hash,
                         entry_fn=recv_req.entry_fn,
                     )
+                    # Inside post-activation try so GPU counter copy failure marks TAINTED (N1).
+                    self._tpe_snapshot_canary_counts()
                 except TpePostActivationError as exc:
                     ctrl.mark_tainted(str(exc))
                     raise
                 except Exception as exc:
-                    # If candidate was already activated before failure, isolate as TAINTED (N3).
+                    # If candidate was already activated before failure, isolate as TAINTED (N3/N1).
                     mr = getattr(self.tp_worker, "model_runner", None)
                     hr_mgr = getattr(mr, "tpe_hot_reload_manager", None) if mr is not None else None
                     if hr_mgr is not None and getattr(hr_mgr, "is_candidate_active", False):
@@ -6488,7 +6496,6 @@ class Scheduler(
                             f"hot_reload failed after activation: {type(exc).__name__}: {exc}"
                         )
                     raise
-                self._tpe_snapshot_canary_counts()
                 ctrl.mark_candidate_ready(recv_req.job_id, cand.artifact_hash)
                 self.send_control_output(
                     TpeTransactionReqOutput(
@@ -6514,6 +6521,14 @@ class Scheduler(
                 )
                 if not self.is_fully_idle():
                     raise RuntimeError("teardown requires scheduler to be fully idle (R4)")
+                # Disarm and clear any lingering logits capture before tearing down candidate.
+                mr = getattr(self.tp_worker, "model_runner", None)
+                logits_collector = (
+                    getattr(mr, "tpe_logits_collector", None) if mr is not None else None
+                )
+                if logits_collector is not None:
+                    logits_collector.disarm()
+                    logits_collector.clear()
                 flushed = self.flush_cache()
                 if not flushed:
                     raise RuntimeError(
@@ -6572,6 +6587,123 @@ class Scheduler(
                         state=ctrl.state.value,
                         error_message=(
                             None if recv_req.sentinel_passed else ctrl.taint_reason
+                        ),
+                    ),
+                    recv_req,
+                )
+            elif recv_req.op == "configure_logits_capture":
+                from sglang.srt.tpe.state import TpeInstanceState
+
+                if not self.is_fully_idle():
+                    raise RuntimeError(
+                        "configure_logits_capture requires scheduler to be fully idle (N5)"
+                    )
+                if ctrl.state in (
+                    TpeInstanceState.DRAINING,
+                    TpeInstanceState.PREPARING,
+                    TpeInstanceState.RESTORING,
+                ):
+                    raise RuntimeError(
+                        f"configure_logits_capture not allowed in state {ctrl.state.value} (N5)"
+                    )
+                if ctrl.state in (
+                    TpeInstanceState.CANDIDATE_READY,
+                    TpeInstanceState.EVALUATING,
+                ) and recv_req.job_id != ctrl.active_job_id:
+                    raise RuntimeError(
+                        f"configure_logits_capture job mismatch: active={ctrl.active_job_id!r}, "
+                        f"requested={recv_req.job_id!r} (N5)"
+                    )
+                mr = getattr(self.tp_worker, "model_runner", None)
+                collector = (
+                    getattr(mr, "tpe_logits_collector", None) if mr is not None else None
+                )
+                if collector is None:
+                    raise RuntimeError(
+                        "TPE logits collector is unavailable (ensure SGLANG_ENABLE_TPE=1 "
+                        "and SamplingObserver is supported)."
+                    )
+                if recv_req.capture_logits_enabled:
+                    collector.arm(
+                        capture_steps=recv_req.capture_steps,
+                        owner_job_id=recv_req.job_id,
+                        owner_generation=ctrl.instance_generation,
+                    )
+                else:
+                    collector.assert_owner(
+                        job_id=recv_req.job_id,
+                        instance_generation=ctrl.instance_generation,
+                    )
+                    collector.disarm()
+                self.send_control_output(
+                    TpeTransactionReqOutput(
+                        success=True,
+                        op=recv_req.op,
+                        op_id=recv_req.op_id,
+                        job_id=recv_req.job_id,
+                        instance_generation=ctrl.instance_generation,
+                        responder_id=ctrl.responder_id,
+                        state=ctrl.state.value,
+                        logits_summary=collector.summary(),
+                    ),
+                    recv_req,
+                )
+            elif recv_req.op == "finalize_logits_capture":
+                if not self.is_fully_idle():
+                    raise RuntimeError(
+                        "finalize_logits_capture requires scheduler to be fully idle (N5)"
+                    )
+                if recv_req.logits_save_path and recv_req.logits_ref_path:
+                    raise ValueError(
+                        "finalize_logits_capture cannot specify both logits_save_path "
+                        "and logits_ref_path (mutually exclusive in Phase 1a, N4)."
+                    )
+                mr = getattr(self.tp_worker, "model_runner", None)
+                collector = (
+                    getattr(mr, "tpe_logits_collector", None) if mr is not None else None
+                )
+                if collector is None:
+                    raise RuntimeError(
+                        "TPE logits collector is unavailable (ensure SGLANG_ENABLE_TPE=1)."
+                    )
+                collector.assert_owner(
+                    job_id=recv_req.job_id,
+                    instance_generation=ctrl.instance_generation,
+                )
+                collector.disarm()
+                summary = collector.summary()
+                op_success = True
+                if recv_req.logits_save_path:
+                    summary = collector.save_reference(
+                        recv_req.logits_save_path,
+                        extra_meta={
+                            "job_id": collector.owner_job_id or recv_req.job_id,
+                            "instance_generation": ctrl.instance_generation,
+                        },
+                    )
+                elif recv_req.logits_ref_path:
+                    report = collector.compare_against_reference(
+                        recv_req.logits_ref_path,
+                        max_abs_diff_threshold=recv_req.max_abs_diff_threshold,
+                        min_cosine_similarity=recv_req.min_cosine_similarity,
+                    )
+                    summary = report
+                    op_success = bool(report["passed"])
+                collector.clear()
+                self.send_control_output(
+                    TpeTransactionReqOutput(
+                        success=op_success,
+                        op=recv_req.op,
+                        op_id=recv_req.op_id,
+                        job_id=recv_req.job_id,
+                        instance_generation=ctrl.instance_generation,
+                        responder_id=ctrl.responder_id,
+                        state=ctrl.state.value,
+                        logits_summary=summary,
+                        error_message=(
+                            None
+                            if op_success
+                            else f"Logits verification failed: {summary.get('failures', [])[:2]}"
                         ),
                     ),
                     recv_req,

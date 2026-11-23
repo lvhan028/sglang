@@ -1012,6 +1012,10 @@ class ModelRunner:
             from sglang.srt.model_executor.model_runner_components.tpe_graph_adapter import (
                 TpeGraphAdapter,
             )
+            from sglang.srt.tpe.logits_observer import (
+                TpeLogitsCollector,
+                TpeLogitsObserver,
+            )
 
             self.tpe_hot_reload_manager = HotReloadManager(
                 self.model,
@@ -1019,9 +1023,18 @@ class ModelRunner:
             )
             self.tpe_hot_reload_manager.install_stable_shell()
             self.tpe_graph_adapter = TpeGraphAdapter(self)
+            self.tpe_logits_collector = TpeLogitsCollector()
+            self.tpe_logits_observer = TpeLogitsObserver(self.tpe_logits_collector)
+            if (
+                self.sampling_observer is None
+                and self.supports_sampling_observer()
+            ):
+                self.sampling_observer = self.tpe_logits_observer
         else:
             self.tpe_hot_reload_manager = None
             self.tpe_graph_adapter = None
+            self.tpe_logits_collector = None
+            self.tpe_logits_observer = None
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup

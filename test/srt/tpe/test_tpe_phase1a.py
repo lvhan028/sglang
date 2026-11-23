@@ -547,6 +547,41 @@ class TestLogitsVerifierAndStaticContracts(unittest.TestCase):
             for method in methods:
                 self.assertIn(method, defined, f"Missing {method} in {rel}")
 
+    def test_control_plane_chain_wired(self) -> None:
+        chain_files = [
+            (
+                "python/sglang/srt/entrypoints/http_server.py",
+                ['"/tpe/transaction"', "tokenizer_manager.tpe_transaction"],
+            ),
+            (
+                "python/sglang/srt/managers/tokenizer_control_mixin.py",
+                [
+                    "TpeTransactionCommunicator",
+                    "tpe_transaction_communicator",
+                    "async def tpe_transaction(",
+                ],
+            ),
+            (
+                "python/sglang/srt/managers/scheduler.py",
+                [
+                    "(TpeTransactionReqInput, self.handle_tpe_transaction)",
+                    "def handle_tpe_transaction(",
+                    "self._poll_tpe_drain()",
+                ],
+            ),
+            (
+                "python/sglang/srt/managers/tp_worker.py",
+                ["def tpe_hot_reload(", "def tpe_teardown("],
+            ),
+        ]
+        for rel, needles in chain_files:
+            full = os.path.join(REPO_ROOT, rel)
+            with open(full, "r", encoding="utf-8") as f:
+                src = f.read()
+            ast.parse(src, filename=full)
+            for needle in needles:
+                self.assertIn(needle, src, f"Missing {needle!r} in {rel}")
+
 
 if __name__ == "__main__":
     unittest.main()

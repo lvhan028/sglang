@@ -157,6 +157,7 @@ from sglang.srt.managers.io_struct import (
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
+    TpeTransactionReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -1851,6 +1852,46 @@ async def continue_generation(
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
+    )
+
+
+@app.post("/tpe/transaction")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def tpe_transaction(
+    obj: Annotated[TpeTransactionReqInput, Body()], request: Request
+):
+    """Execute a TPE control-plane transaction (drain/hot_reload/teardown/set_admission)."""
+    if os.environ.get("SGLANG_ENABLE_TPE", "0") != "1":
+        return ORJSONResponse(
+            content={"success": False, "error": "TPE is disabled (set SGLANG_ENABLE_TPE=1)."},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    try:
+        results = await _global_state.tokenizer_manager.tpe_transaction(obj)
+    except asyncio.TimeoutError:
+        return ORJSONResponse(
+            content={
+                "success": False,
+                "op": obj.op,
+                "op_id": obj.op_id,
+                "job_id": obj.job_id,
+                "instance_generation": obj.instance_generation,
+                "error": f"TPE transaction timed out after {obj.timeout_s}s",
+            },
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    all_ok = bool(results) and all(r.success for r in results)
+    return ORJSONResponse(
+        content={
+            "success": all_ok,
+            "responses": [msgspec_to_builtins(r) for r in results],
+        },
+        status_code=HTTPStatus.OK if all_ok else HTTPStatus.BAD_REQUEST,
     )
 
 

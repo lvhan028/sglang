@@ -276,6 +276,26 @@ class BaseTpWorker(ABC):
         output = self.model_runner.forward(forward_batch)
         return output.logits_output, output.can_run_graph
 
+    def tpe_hot_reload(
+        self,
+        *,
+        job_id: str,
+        code_utf8: str,
+        artifact_hash: Optional[str] = None,
+        entry_fn: str = "forward",
+    ):
+        return self.model_runner.tpe_hot_reload(
+            job_id=job_id,
+            code_utf8=code_utf8,
+            artifact_hash=artifact_hash,
+            entry_fn=entry_fn,
+        )
+
+    def tpe_teardown(self, *, recapture_baseline: bool = True):
+        return self.model_runner.tpe_teardown(
+            recapture_baseline=recapture_baseline,
+        )
+
 
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""

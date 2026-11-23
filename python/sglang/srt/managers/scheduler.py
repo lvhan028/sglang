@@ -140,6 +140,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    TpeTransactionReqInput,
+    TpeTransactionReqOutput,
     EndWeightUpdateReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -1922,6 +1924,7 @@ class Scheduler(
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (TpeTransactionReqInput, self.handle_tpe_transaction),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
                     RemoveExternalCorpusReqInput,
@@ -2031,6 +2034,8 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            if getattr(self, "_tpe_pending_drain_req", None) is not None:
+                self._poll_tpe_drain()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2051,6 +2056,8 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
+                if getattr(self, "_tpe_pending_drain_req", None) is not None:
+                    self._poll_tpe_drain()
 
             # Update last_batch
             self.last_batch = batch
@@ -6196,6 +6203,190 @@ class Scheduler(
             print(f"[Scheduler] handle_dumper_control error: {e}", flush=True)
             self.ipc_channels.send_to_tokenizer.send_output(
                 DumperControlReqOutput(success=False, response=[], error=str(e)),
+                recv_req,
+            )
+
+    def _get_tpe_controller(self):
+        ctrl = getattr(self, "_tpe_controller", None)
+        if ctrl is None:
+            from sglang.srt.tpe.controller import TpeSchedulerController
+
+            gen = int(os.environ.get("SGLANG_TPE_INSTANCE_GENERATION", "1"))
+            responder_id = f"dp{getattr(self, 'dp_rank', 0)}_tp{getattr(self, 'tp_rank', 0)}"
+            ctrl = TpeSchedulerController(
+                instance_generation=gen,
+                responder_id=responder_id,
+            )
+            self._tpe_controller = ctrl
+            self._tpe_pending_drain_req = None
+        return ctrl
+
+    def _tpe_sync_streams(self) -> None:
+        for attr in ("forward_stream", "schedule_stream", "copy_stream"):
+            stream = getattr(self, attr, None)
+            if stream is not None and hasattr(stream, "synchronize"):
+                stream.synchronize()
+        current_platform.synchronize()
+
+    def _tpe_finalize_canary(self) -> Dict[str, Any]:
+        mr = getattr(self.tp_worker, "model_runner", None)
+        canary_mgr = getattr(mr, "canary_manager", None) if mr is not None else None
+        if canary_mgr is not None and hasattr(canary_mgr, "finalize_job_check"):
+            return canary_mgr.finalize_job_check()
+        return {"canary_enabled": False, "canary_violations_detected": False}
+
+    def _tpe_clear_keep_alive(self) -> None:
+        buf = getattr(self, "batch_record_buf", None)
+        if buf is not None and hasattr(buf, "clear"):
+            buf.clear()
+
+    def _poll_tpe_drain(self) -> None:
+        pending_req = getattr(self, "_tpe_pending_drain_req", None)
+        if pending_req is None:
+            return
+        ctrl = self._get_tpe_controller()
+        res = ctrl.poll_drain(
+            is_fully_idle_fn=lambda: self.is_fully_idle(),
+            result_queue_empty_fn=lambda: not getattr(self, "result_queue", None),
+            sync_streams_fn=self._tpe_sync_streams,
+            finalize_canary_fn=self._tpe_finalize_canary,
+            clear_keep_alive_fn=self._tpe_clear_keep_alive,
+        )
+        if res is None:
+            return
+        self._tpe_pending_drain_req = None
+        out = TpeTransactionReqOutput(
+            success=bool(res["success"]),
+            op=str(res["op"]),
+            op_id=str(res["op_id"]),
+            job_id=str(res["job_id"]),
+            instance_generation=int(res["instance_generation"]),
+            responder_id=str(res["responder_id"]),
+            state=str(res["state"]),
+            phase_timings_s={"drain_s": float(res.get("elapsed_s", 0.0))},
+            canary_summary=res.get("canary_summary"),
+            error_message=res.get("error_message"),
+        )
+        self.send_control_output(out, pending_req)
+
+    def handle_tpe_transaction(self, recv_req: TpeTransactionReqInput):
+        ctrl = self._get_tpe_controller()
+        if os.environ.get("SGLANG_ENABLE_TPE", "0") != "1":
+            self.send_control_output(
+                TpeTransactionReqOutput(
+                    success=False,
+                    op=recv_req.op,
+                    op_id=recv_req.op_id,
+                    job_id=recv_req.job_id,
+                    instance_generation=ctrl.instance_generation,
+                    responder_id=ctrl.responder_id,
+                    state=ctrl.state.value,
+                    error_message="TPE is disabled (set SGLANG_ENABLE_TPE=1).",
+                ),
+                recv_req,
+            )
+            return
+
+        try:
+            if recv_req.op == "set_admission":
+                from sglang.srt.tpe.state import TpeAdmissionMode
+
+                mode = TpeAdmissionMode(recv_req.admission_mode)
+                ctrl.set_admission(mode, job_id=recv_req.job_id)
+                self.send_control_output(
+                    TpeTransactionReqOutput(
+                        success=True,
+                        op=recv_req.op,
+                        op_id=recv_req.op_id,
+                        job_id=recv_req.job_id,
+                        instance_generation=ctrl.instance_generation,
+                        responder_id=ctrl.responder_id,
+                        state=ctrl.state.value,
+                    ),
+                    recv_req,
+                )
+            elif recv_req.op == "drain":
+                ctrl.begin_drain(
+                    op_id=recv_req.op_id,
+                    job_id=recv_req.job_id,
+                    instance_generation=recv_req.instance_generation,
+                    purpose=recv_req.drain_purpose or "hot_reload",
+                    timeout_s=recv_req.timeout_s,
+                )
+                self._tpe_pending_drain_req = recv_req
+                self._poll_tpe_drain()
+            elif recv_req.op == "hot_reload":
+                if recv_req.code_utf8 is None:
+                    raise ValueError("hot_reload requires code_utf8")
+                cand, stats = self.tp_worker.tpe_hot_reload(
+                    job_id=recv_req.job_id,
+                    code_utf8=recv_req.code_utf8,
+                    artifact_hash=recv_req.artifact_hash,
+                    entry_fn=recv_req.entry_fn,
+                )
+                ctrl.mark_candidate_ready(recv_req.job_id, cand.artifact_hash)
+                self.send_control_output(
+                    TpeTransactionReqOutput(
+                        success=True,
+                        op=recv_req.op,
+                        op_id=recv_req.op_id,
+                        job_id=recv_req.job_id,
+                        instance_generation=ctrl.instance_generation,
+                        responder_id=ctrl.responder_id,
+                        state=ctrl.state.value,
+                        phase_timings_s={
+                            "cleanup_s": stats.cleanup_time_s,
+                            "capture_s": stats.capture_time_s,
+                        },
+                    ),
+                    recv_req,
+                )
+            elif recv_req.op == "teardown":
+                self.flush_cache()
+                teardown_err, stats = self.tp_worker.tpe_teardown(
+                    recapture_baseline=True
+                )
+                if teardown_err is not None:
+                    ctrl.mark_tainted(teardown_err)
+                else:
+                    ctrl.begin_baseline_verifying()
+                timings = (
+                    {
+                        "cleanup_s": stats.cleanup_time_s,
+                        "capture_s": stats.capture_time_s,
+                    }
+                    if stats is not None
+                    else {}
+                )
+                self.send_control_output(
+                    TpeTransactionReqOutput(
+                        success=teardown_err is None,
+                        op=recv_req.op,
+                        op_id=recv_req.op_id,
+                        job_id=recv_req.job_id,
+                        instance_generation=ctrl.instance_generation,
+                        responder_id=ctrl.responder_id,
+                        state=ctrl.state.value,
+                        phase_timings_s=timings,
+                        error_message=teardown_err,
+                    ),
+                    recv_req,
+                )
+            else:
+                raise ValueError(f"Unsupported TPE op: {recv_req.op!r}")
+        except Exception as e:
+            logger.exception("TPE transaction %s failed", recv_req.op)
+            self.send_control_output(
+                TpeTransactionReqOutput(
+                    success=False,
+                    op=recv_req.op,
+                    op_id=recv_req.op_id,
+                    job_id=recv_req.job_id,
+                    instance_generation=ctrl.instance_generation,
+                    responder_id=ctrl.responder_id,
+                    state=ctrl.state.value,
+                    error_message=f"{type(e).__name__}: {e}",
+                ),
                 recv_req,
             )
 

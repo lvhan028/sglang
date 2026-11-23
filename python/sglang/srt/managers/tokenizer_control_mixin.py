@@ -74,6 +74,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    TpeTransactionReqInput,
+    TpeTransactionReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -195,6 +197,15 @@ class TokenizerControlMixin:
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
+        from sglang.srt.tpe.communicator import TpeTransactionCommunicator
+
+        self.tpe_transaction_communicator = TpeTransactionCommunicator(
+            self._dispatch_to_scheduler,
+            get_parallel().num_dp_ranks,
+        )
+        dispatch_pairs.append(
+            (TpeTransactionReqOutput, self.tpe_transaction_communicator.handle_recv)
+        )
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
@@ -212,6 +223,7 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
+        self.tpe_transaction_communicator.set_fan_out(worker_count)
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
 
     async def add_external_corpus(
@@ -997,6 +1009,14 @@ class TokenizerControlMixin:
     ) -> List[DumperControlReqOutput]:
         self.auto_create_handle_loop()
         return await self.dumper_control_communicator(obj)
+
+    async def tpe_transaction(
+        self: TokenizerManager, obj: TpeTransactionReqInput
+    ) -> List[TpeTransactionReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.tpe_transaction_communicator.call(
+            obj, timeout_s=obj.timeout_s
+        )
 
     async def get_loads(
         self: TokenizerManager,

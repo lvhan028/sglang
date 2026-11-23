@@ -2617,7 +2617,13 @@ class DumperControlReqOutput(BaseReq, kw_only=True):
 class TpeTransactionReqInput(BaseReq, kw_only=True):
     """Unified TPE control transaction request (R8, F4)."""
 
-    op: Literal["drain", "hot_reload", "teardown", "set_admission"]
+    op: Literal[
+        "drain",
+        "hot_reload",
+        "teardown",
+        "set_admission",
+        "complete_baseline_verifying",
+    ]
     op_id: str
     job_id: str
     instance_generation: int
@@ -2627,6 +2633,7 @@ class TpeTransactionReqInput(BaseReq, kw_only=True):
     entry_fn: str = "forward"
     drain_purpose: Optional[Literal["hot_reload", "teardown"]] = None
     admission_mode: Optional[Literal["CLOSED", "JOB_ONLY", "BASELINE_PROBE_ONLY"]] = None
+    sentinel_passed: Optional[bool] = None
     timeout_s: float = 30.0
 
 
@@ -2640,6 +2647,7 @@ class TpeTransactionReqOutput(BaseReq, kw_only=True):
     instance_generation: int
     responder_id: str
     state: str
+    artifact_hash: Optional[str] = None
     phase_timings_s: Dict[str, float] = msgspec.field(default_factory=dict)
     canary_summary: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None

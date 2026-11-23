@@ -120,6 +120,20 @@ class TpeTransactionCommunicator(Generic[TReq, TResp]):
             )
             return False
 
+        resp_hash = getattr(resp, "artifact_hash", None)
+        if (
+            waiter.expected_artifact_hash is not None
+            and resp_hash is not None
+            and resp_hash != waiter.expected_artifact_hash
+        ):
+            self.dropped_response_count += 1
+            logger.warning(
+                "TPE communicator dropped artifact_hash mismatch: got %r, expected %r",
+                resp_hash,
+                waiter.expected_artifact_hash,
+            )
+            return False
+
         if not responder_id:
             self.dropped_response_count += 1
             logger.warning("TPE communicator dropped response with empty responder_id.")

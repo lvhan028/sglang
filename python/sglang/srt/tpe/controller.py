@@ -17,11 +17,43 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 from sglang.srt.tpe.state import TpeAdmissionMode, TpeInstanceState
 
 logger = logging.getLogger(__name__)
+
+
+def parse_tpe_admission_key(
+    extra_key: Optional[str],
+) -> Tuple[Optional[str], Optional[int], bool]:
+    """Parse TPE lease metadata carried in `GenerateReqInput.extra_key`.
+
+    Supported formats:
+      - ``"tpe:job=<job_id>:gen=<generation>"`` -> ``(job_id, generation, False)``
+      - ``"tpe:sentinel:gen=<generation>"``     -> ``(None, generation, True)``
+      - anything else / None                    -> ``(None, None, False)``
+    """
+    if not extra_key or not isinstance(extra_key, str):
+        return None, None, False
+    if not extra_key.startswith("tpe:"):
+        return None, None, False
+    parts = extra_key.split(":")
+    if len(parts) < 3:
+        return None, None, False
+    if parts[1] == "sentinel" and parts[2].startswith("gen="):
+        try:
+            return None, int(parts[2][4:]), True
+        except ValueError:
+            return None, None, False
+    if parts[1].startswith("job=") and parts[2].startswith("gen="):
+        job_id = parts[1][4:]
+        try:
+            gen = int(parts[2][4:])
+        except ValueError:
+            return None, None, False
+        return (job_id or None), gen, False
+    return None, None, False
 
 
 @dataclass
@@ -52,18 +84,73 @@ class TpeSchedulerController:
         self.admission_mode: TpeAdmissionMode = TpeAdmissionMode.BASELINE_PROBE_ONLY
         self.active_job_id: Optional[str] = None
         self.active_artifact_hash: Optional[str] = None
+        self.drained_job_id: Optional[str] = None
+        self.drained_purpose: Optional[str] = None
         self.pending_drain: Optional[PendingDrain] = None
         self.taint_reason: Optional[str] = None
+
+    def assert_generation_and_healthy(self, instance_generation: int) -> None:
+        """Validate transaction generation and ensure instance is not TAINTED."""
+        if instance_generation != self.instance_generation:
+            raise ValueError(
+                f"Stale generation: got {instance_generation}, current {self.instance_generation}"
+            )
+        if self.state in (TpeInstanceState.TAINTED, TpeInstanceState.RESTARTING):
+            raise RuntimeError(
+                f"Instance is {self.state.value}: {self.taint_reason or 'restart required'}"
+            )
+
+    def assert_ready_for_hot_reload(
+        self, *, job_id: str, instance_generation: int
+    ) -> None:
+        """Require completed pre-install drain for this exact job and generation (N2)."""
+        self.assert_generation_and_healthy(instance_generation)
+        if self.state != TpeInstanceState.PREPARING:
+            raise RuntimeError(
+                f"hot_reload requires state=PREPARING (completed drain), got {self.state.value}"
+            )
+        if self.drained_purpose != "hot_reload" or self.drained_job_id != job_id:
+            raise RuntimeError(
+                f"hot_reload drain mismatch: drained=({self.drained_purpose!r}, {self.drained_job_id!r}), "
+                f"requested job={job_id!r}"
+            )
+
+    def assert_ready_for_teardown(
+        self, *, job_id: str, instance_generation: int
+    ) -> None:
+        """Require completed pre-teardown drain for the active job and generation (N2)."""
+        self.assert_generation_and_healthy(instance_generation)
+        if self.state != TpeInstanceState.RESTORING:
+            raise RuntimeError(
+                f"teardown requires state=RESTORING (completed drain), got {self.state.value}"
+            )
+        if self.drained_purpose != "teardown" or self.drained_job_id != job_id:
+            raise RuntimeError(
+                f"teardown drain mismatch: drained=({self.drained_purpose!r}, {self.drained_job_id!r}), "
+                f"requested job={job_id!r}"
+            )
+        if self.active_job_id is not None and self.active_job_id != job_id:
+            raise RuntimeError(
+                f"teardown job mismatch: active_job_id={self.active_job_id!r}, requested={job_id!r}"
+            )
 
     def set_admission(
         self,
         mode: TpeAdmissionMode,
         *,
         job_id: Optional[str] = None,
+        instance_generation: Optional[int] = None,
     ) -> None:
+        if instance_generation is not None:
+            self.assert_generation_and_healthy(instance_generation)
+        elif self.state in (TpeInstanceState.TAINTED, TpeInstanceState.RESTARTING):
+            raise RuntimeError(
+                f"Instance is {self.state.value}: {self.taint_reason or 'restart required'}"
+            )
         self.admission_mode = mode
         if mode == TpeAdmissionMode.JOB_ONLY:
-            assert job_id is not None, "JOB_ONLY admission requires job_id"
+            if job_id is None:
+                raise ValueError("JOB_ONLY admission requires job_id")
             self.active_job_id = job_id
 
     def can_admit_request(
@@ -103,14 +190,9 @@ class TpeSchedulerController:
         timeout_s: float = 30.0,
     ) -> None:
         """Stop admission and arm non-blocking drain in the scheduler event loop."""
-        if instance_generation != self.instance_generation:
-            raise ValueError(
-                f"Stale generation: got {instance_generation}, current {self.instance_generation}"
-            )
+        self.assert_generation_and_healthy(instance_generation)
         if purpose not in ("hot_reload", "teardown"):
             raise ValueError(f"Unsupported drain purpose: {purpose!r}")
-        if self.state == TpeInstanceState.TAINTED:
-            raise RuntimeError(f"Instance is TAINTED: {self.taint_reason}")
         if self.pending_drain is not None:
             raise RuntimeError(
                 f"Drain already in progress (op_id={self.pending_drain.op_id})"
@@ -118,6 +200,8 @@ class TpeSchedulerController:
 
         self.admission_mode = TpeAdmissionMode.CLOSED
         self.state = TpeInstanceState.DRAINING
+        self.drained_job_id = None
+        self.drained_purpose = None
         now = self._clock()
         self.pending_drain = PendingDrain(
             op_id=op_id,
@@ -179,6 +263,8 @@ class TpeSchedulerController:
             clear_keep_alive_fn()
 
         self.pending_drain = None
+        self.drained_job_id = drain.job_id
+        self.drained_purpose = drain.purpose
         self.state = (
             TpeInstanceState.PREPARING
             if drain.purpose == "hot_reload"
@@ -200,16 +286,31 @@ class TpeSchedulerController:
     def mark_candidate_ready(self, job_id: str, artifact_hash: str) -> None:
         self.active_job_id = job_id
         self.active_artifact_hash = artifact_hash
+        self.drained_job_id = None
+        self.drained_purpose = None
         self.state = TpeInstanceState.CANDIDATE_READY
         self.admission_mode = TpeAdmissionMode.JOB_ONLY
 
     def begin_baseline_verifying(self) -> None:
         self.active_job_id = None
         self.active_artifact_hash = None
+        self.drained_job_id = None
+        self.drained_purpose = None
         self.state = TpeInstanceState.BASELINE_VERIFYING
         self.admission_mode = TpeAdmissionMode.BASELINE_PROBE_ONLY
 
-    def complete_baseline_verifying(self, *, sentinel_passed: bool) -> None:
+    def complete_baseline_verifying(
+        self,
+        *,
+        sentinel_passed: bool,
+        instance_generation: Optional[int] = None,
+    ) -> None:
+        if instance_generation is not None:
+            self.assert_generation_and_healthy(instance_generation)
+        if self.state != TpeInstanceState.BASELINE_VERIFYING:
+            raise RuntimeError(
+                f"complete_baseline_verifying requires state=BASELINE_VERIFYING, got {self.state.value}"
+            )
         if sentinel_passed:
             self.state = TpeInstanceState.BASELINE_READY
             self.admission_mode = TpeAdmissionMode.BASELINE_PROBE_ONLY
@@ -221,6 +322,8 @@ class TpeSchedulerController:
         self.admission_mode = TpeAdmissionMode.CLOSED
         self.taint_reason = reason
         self.pending_drain = None
+        self.drained_job_id = None
+        self.drained_purpose = None
         logger.error(
             "TPE scheduler controller generation=%d TAINTED: %s",
             self.instance_generation,

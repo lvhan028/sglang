@@ -21,6 +21,13 @@ class TpeInstanceState(str, enum.Enum):
     RESTARTING = "RESTARTING"
 
 
+class TpePostActivationError(RuntimeError):
+    """Raised when a failure occurs AFTER candidate activation or graph destruction.
+
+    The instance is in a partially mutated state and MUST be marked TAINTED.
+    """
+
+
 class TpeAdmissionMode(str, enum.Enum):
     CLOSED = "CLOSED"
     JOB_ONLY = "JOB_ONLY"

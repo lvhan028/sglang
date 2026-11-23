@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Phase 0 utility: build eval/sentinel fixtures and record baseline references.
+"""Phase 0 utility: build eval/sentinel fixtures and record text + top-logprobs baselines.
 
 Generates deterministic batch cases (with ignore_eos=True and fixed
-max_new_tokens), records baseline outputs/logprobs/logits references, and runs
-a native baseline-vs-baseline self-comparison to establish the real hardware
-floating-point noise floor before Phase 1 candidate evaluation.
+max_new_tokens), records baseline generated text and top-5 logprobs via HTTP
+`/generate`, and runs a native baseline-vs-baseline text self-comparison.
+
+Note: HTTP `/generate` does not return full-vocab logits; full-vocab numerical
+logits gating (using `sglang.srt.tpe.logits_verifier.verify_logits_pair`)
+requires a runner-side logits export hook in Phase 1a GPU evaluation.
 """
 
 from __future__ import annotations

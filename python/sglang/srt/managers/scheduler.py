@@ -2257,6 +2257,11 @@ class Scheduler(
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
                 continue
 
+            if os.environ.get("SGLANG_ENABLE_TPE", "0") == "1":
+                recv_req = self._filter_tpe_admitted_request(recv_req)
+                if recv_req is None:
+                    continue
+
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
@@ -6221,6 +6226,87 @@ class Scheduler(
             self._tpe_pending_drain_req = None
         return ctrl
 
+    def _validate_tpe_phase1a_runtime(self) -> None:
+        """Validate Phase 1a support matrix before executing TPE transactions."""
+        from sglang.srt.tpe.state import assert_phase1a_config
+
+        server_args = getattr(self, "server_args", None)
+        if server_args is None:
+            return
+        enable_overlap = not getattr(server_args, "disable_overlap_schedule", True)
+        prefill_backend = getattr(server_args, "cuda_graph_backend_prefill", "disabled")
+        decode_backend = getattr(server_args, "cuda_graph_backend_decode", "full")
+        assert_phase1a_config(
+            prefill_cuda_graph_disabled=(str(prefill_backend).lower() == "disabled"),
+            decode_cuda_graph_full=(str(decode_backend).lower() in ("full", "default", "none")),
+            enable_torch_compile=bool(getattr(server_args, "enable_torch_compile", False)),
+            enable_megakernel_or_monokernel=bool(
+                getattr(server_args, "enable_megakernel", False)
+                or getattr(server_args, "enable_monokernel", False)
+            ),
+            enable_post_capture_kv_sizing=(
+                os.environ.get("SGLANG_ENABLE_POST_CAPTURE_KV_SIZING", "0") == "1"
+            ),
+            enable_speculative=(getattr(server_args, "speculative_algorithm", None) is not None),
+            disaggregation_mode=str(getattr(server_args, "disaggregation_mode", "null") or "null"),
+            pp_size=int(getattr(server_args, "pp_size", 1) or 1),
+            ep_size=int(getattr(server_args, "ep_size", 1) or 1),
+            enable_dp_attention=bool(getattr(server_args, "enable_dp_attention", False)),
+            enable_hierarchical_cache=bool(getattr(server_args, "enable_hierarchical_cache", False)),
+            enable_overlap=enable_overlap,
+        )
+
+    def _reject_tpe_generation_req(self, tokenized_req, reason: str) -> None:
+        abort_req = AbortReq(
+            rid=getattr(tokenized_req, "rid", ""),
+            abort_message=reason,
+        )
+        self.send_abort_output(abort_req, tokenized_req)
+
+    def _filter_tpe_admitted_request(self, recv_req):
+        """Enforce TPE admission control on incoming generation requests (N1)."""
+        from sglang.srt.tpe.controller import parse_tpe_admission_key
+
+        if isinstance(recv_req, TokenizedGenerateReqInput):
+            ctrl = self._get_tpe_controller()
+            job_id, gen, is_probe = parse_tpe_admission_key(
+                getattr(recv_req, "extra_key", None)
+            )
+            if not ctrl.can_admit_request(
+                req_job_id=job_id,
+                req_generation=gen,
+                is_baseline_probe=is_probe,
+            ):
+                self._reject_tpe_generation_req(
+                    recv_req,
+                    f"TPE admission rejected (mode={ctrl.admission_mode.value}, state={ctrl.state.value})",
+                )
+                return None
+            return recv_req
+        if isinstance(recv_req, BatchTokenizedGenerateReqInput):
+            ctrl = self._get_tpe_controller()
+            admitted = []
+            for sub_req in recv_req.batch:
+                job_id, gen, is_probe = parse_tpe_admission_key(
+                    getattr(sub_req, "extra_key", None)
+                )
+                if ctrl.can_admit_request(
+                    req_job_id=job_id,
+                    req_generation=gen,
+                    is_baseline_probe=is_probe,
+                ):
+                    admitted.append(sub_req)
+                else:
+                    self._reject_tpe_generation_req(
+                        sub_req,
+                        f"TPE admission rejected (mode={ctrl.admission_mode.value}, state={ctrl.state.value})",
+                    )
+            if not admitted:
+                return None
+            recv_req.batch = admitted
+            return recv_req
+        return recv_req
+
     def _tpe_sync_streams(self) -> None:
         for attr in ("forward_stream", "schedule_stream", "copy_stream"):
             stream = getattr(self, attr, None)
@@ -6270,6 +6356,8 @@ class Scheduler(
         self.send_control_output(out, pending_req)
 
     def handle_tpe_transaction(self, recv_req: TpeTransactionReqInput):
+        from sglang.srt.tpe.state import TpeAdmissionMode, TpePostActivationError
+
         ctrl = self._get_tpe_controller()
         if os.environ.get("SGLANG_ENABLE_TPE", "0") != "1":
             self.send_control_output(
@@ -6288,11 +6376,17 @@ class Scheduler(
             return
 
         try:
-            if recv_req.op == "set_admission":
-                from sglang.srt.tpe.state import TpeAdmissionMode
+            self._validate_tpe_phase1a_runtime()
+            # Validate generation & non-TAINTED state BEFORE any side effect (N2).
+            ctrl.assert_generation_and_healthy(recv_req.instance_generation)
 
+            if recv_req.op == "set_admission":
                 mode = TpeAdmissionMode(recv_req.admission_mode)
-                ctrl.set_admission(mode, job_id=recv_req.job_id)
+                ctrl.set_admission(
+                    mode,
+                    job_id=recv_req.job_id,
+                    instance_generation=recv_req.instance_generation,
+                )
                 self.send_control_output(
                     TpeTransactionReqOutput(
                         success=True,
@@ -6316,14 +6410,31 @@ class Scheduler(
                 self._tpe_pending_drain_req = recv_req
                 self._poll_tpe_drain()
             elif recv_req.op == "hot_reload":
+                ctrl.assert_ready_for_hot_reload(
+                    job_id=recv_req.job_id,
+                    instance_generation=recv_req.instance_generation,
+                )
                 if recv_req.code_utf8 is None:
                     raise ValueError("hot_reload requires code_utf8")
-                cand, stats = self.tp_worker.tpe_hot_reload(
-                    job_id=recv_req.job_id,
-                    code_utf8=recv_req.code_utf8,
-                    artifact_hash=recv_req.artifact_hash,
-                    entry_fn=recv_req.entry_fn,
-                )
+                try:
+                    cand, stats = self.tp_worker.tpe_hot_reload(
+                        job_id=recv_req.job_id,
+                        code_utf8=recv_req.code_utf8,
+                        artifact_hash=recv_req.artifact_hash,
+                        entry_fn=recv_req.entry_fn,
+                    )
+                except TpePostActivationError as exc:
+                    ctrl.mark_tainted(str(exc))
+                    raise
+                except Exception as exc:
+                    # If candidate was already activated before failure, isolate as TAINTED (N3).
+                    mr = getattr(self.tp_worker, "model_runner", None)
+                    hr_mgr = getattr(mr, "tpe_hot_reload_manager", None) if mr is not None else None
+                    if hr_mgr is not None and getattr(hr_mgr, "is_candidate_active", False):
+                        ctrl.mark_tainted(
+                            f"hot_reload failed after activation: {type(exc).__name__}: {exc}"
+                        )
+                    raise
                 ctrl.mark_candidate_ready(recv_req.job_id, cand.artifact_hash)
                 self.send_control_output(
                     TpeTransactionReqOutput(
@@ -6334,6 +6445,7 @@ class Scheduler(
                         instance_generation=ctrl.instance_generation,
                         responder_id=ctrl.responder_id,
                         state=ctrl.state.value,
+                        artifact_hash=cand.artifact_hash,
                         phase_timings_s={
                             "cleanup_s": stats.cleanup_time_s,
                             "capture_s": stats.capture_time_s,
@@ -6342,10 +6454,24 @@ class Scheduler(
                     recv_req,
                 )
             elif recv_req.op == "teardown":
-                self.flush_cache()
-                teardown_err, stats = self.tp_worker.tpe_teardown(
-                    recapture_baseline=True
+                ctrl.assert_ready_for_teardown(
+                    job_id=recv_req.job_id,
+                    instance_generation=recv_req.instance_generation,
                 )
+                flushed = self.flush_cache()
+                if not flushed:
+                    raise RuntimeError(
+                        "flush_cache() returned False before teardown; aborting unload"
+                    )
+                try:
+                    teardown_err, stats = self.tp_worker.tpe_teardown(
+                        recapture_baseline=True
+                    )
+                except Exception as exc:
+                    ctrl.mark_tainted(
+                        f"teardown raised after flush: {type(exc).__name__}: {exc}"
+                    )
+                    raise
                 if teardown_err is not None:
                     ctrl.mark_tainted(teardown_err)
                 else:
@@ -6369,6 +6495,28 @@ class Scheduler(
                         state=ctrl.state.value,
                         phase_timings_s=timings,
                         error_message=teardown_err,
+                    ),
+                    recv_req,
+                )
+            elif recv_req.op == "complete_baseline_verifying":
+                if recv_req.sentinel_passed is None:
+                    raise ValueError("complete_baseline_verifying requires sentinel_passed")
+                ctrl.complete_baseline_verifying(
+                    sentinel_passed=bool(recv_req.sentinel_passed),
+                    instance_generation=recv_req.instance_generation,
+                )
+                self.send_control_output(
+                    TpeTransactionReqOutput(
+                        success=bool(recv_req.sentinel_passed),
+                        op=recv_req.op,
+                        op_id=recv_req.op_id,
+                        job_id=recv_req.job_id,
+                        instance_generation=ctrl.instance_generation,
+                        responder_id=ctrl.responder_id,
+                        state=ctrl.state.value,
+                        error_message=(
+                            None if recv_req.sentinel_passed else ctrl.taint_reason
+                        ),
                     ),
                     recv_req,
                 )

@@ -46,19 +46,13 @@ class SweepOrchestrator:
     def attach_radix_cache(self, radix_cache: BasePrefixCache) -> None:
         self._radix_cache = radix_cache
 
-    def maybe_run_sweep(self) -> None:
-        if self._config.sweep_interval == 0:
-            return
-        outer_step_counter = self._outer_step_counter_getter()
-        if (
-            self._last_sweep_step >= 0
-            and outer_step_counter - self._last_sweep_step < self._config.sweep_interval
-        ):
-            return
-        self._last_sweep_step = outer_step_counter
-
+    def run_sweep(self) -> bool:
+        """Execute a full radix-cache canary sweep unconditionally (ignoring sweep_interval)."""
         if self._radix_cache is None:
-            return
+            return False
+
+        outer_step_counter = self._outer_step_counter_getter()
+        self._last_sweep_step = outer_step_counter
 
         violation_log = self._device_state.violation_log
         for group in self._buffer_groups:
@@ -82,3 +76,15 @@ class SweepOrchestrator:
             self._sweep_passes,
             outer_step_counter,
         )
+        return True
+
+    def maybe_run_sweep(self) -> None:
+        if self._config.sweep_interval == 0:
+            return
+        outer_step_counter = self._outer_step_counter_getter()
+        if (
+            self._last_sweep_step >= 0
+            and outer_step_counter - self._last_sweep_step < self._config.sweep_interval
+        ):
+            return
+        self.run_sweep()

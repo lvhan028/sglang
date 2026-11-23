@@ -24,7 +24,9 @@ mkdir -p \
   "${SGLANG_CUTE_AOT_CACHE_DIR}" \
   "${TORCH_EXTENSIONS_DIR}"
 
-# Explicitly disable post-capture KV sizing before pool construction (F6)
+# Explicitly enable TPE and disable post-capture KV sizing before pool construction (F6)
+export SGLANG_ENABLE_TPE="${SGLANG_ENABLE_TPE:-1}"
+export SGLANG_TPE_INSTANCE_GENERATION="${SGLANG_TPE_INSTANCE_GENERATION:-1}"
 export SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=0
 
 exec python3 -m sglang.launch_server \

@@ -1032,6 +1032,22 @@ class ModelRunner:
             token_oracle_manager=self._token_oracle_manager,
         )
 
+        # Init ngram embedding token table
+        self.init_ngram_embedding_manager()
+        self.maybe_init_watermark_state()
+
+        self.maybe_init_hisparse_coordinator()
+
+        self.init_routed_experts_capturer()
+        self.init_indexer_capturer()
+
+        self.graph_shared_output = None
+        # Set once real decode CUDA graphs are captured (makes on-flip role-switch
+        # capture idempotent).
+        self.decode_cuda_graph_captured = False
+        # Captured decode bs; exposed via /get_server_info for role-switch queries.
+        self.decode_cuda_graph_capture_bs: list[int] = []
+
     def tpe_hot_reload(
         self,
         *,
@@ -1041,17 +1057,26 @@ class ModelRunner:
         entry_fn: str = "forward",
     ):
         """Activate a TPE candidate via the stable shell and recapture decode CUDA graphs."""
+        from sglang.srt.tpe.state import TpePostActivationError
+
         if self.tpe_hot_reload_manager is None or self.tpe_graph_adapter is None:
             raise RuntimeError(
                 "TPE is not enabled on this ModelRunner (set SGLANG_ENABLE_TPE=1)."
             )
+        # Pre-activation errors (syntax, hash mismatch, setup) raise normally with baseline intact.
         candidate = self.tpe_hot_reload_manager.load_and_activate(
             job_id=job_id,
             code_utf8=code_utf8,
             artifact_hash=artifact_hash,
             entry_fn=entry_fn,
         )
-        stats = self.tpe_graph_adapter.recapture_decode_graphs()
+        try:
+            stats = self.tpe_graph_adapter.recapture_decode_graphs()
+        except Exception as exc:
+            raise TpePostActivationError(
+                f"Capture failed after candidate activation for job={job_id}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         return candidate, stats
 
     def tpe_teardown(self, *, recapture_baseline: bool = True):
@@ -1069,22 +1094,6 @@ class ModelRunner:
             else None
         )
         return teardown_error, stats
-
-        # Init ngram embedding token table
-        self.init_ngram_embedding_manager()
-        self.maybe_init_watermark_state()
-
-        self.maybe_init_hisparse_coordinator()
-
-        self.init_routed_experts_capturer()
-        self.init_indexer_capturer()
-
-        self.graph_shared_output = None
-        # Set once real decode CUDA graphs are captured (makes on-flip role-switch
-        # capture idempotent).
-        self.decode_cuda_graph_captured = False
-        # Captured decode bs; exposed via /get_server_info for role-switch queries.
-        self.decode_cuda_graph_capture_bs: list[int] = []
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:

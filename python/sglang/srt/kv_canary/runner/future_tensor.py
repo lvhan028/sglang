@@ -126,3 +126,20 @@ class DelayedDeviceHostHandler:
             self._future = FutureTensors.device_to_host(
                 device_data, d2h_stream=self.d2h_stream
             )
+
+    def drain(
+        self,
+        *,
+        postprocess_on_host: Callable[[_TensorOrDict], None],
+    ) -> bool:
+        """Flush any pending delayed D2H future without staging a new step.
+
+        Returns True if a pending future was drained, False otherwise.
+        """
+        pending = self._future
+        if pending is None:
+            return False
+        self._future = None
+        postprocess_on_host(pending.wait())
+        return True
+

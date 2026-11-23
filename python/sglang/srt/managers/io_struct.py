@@ -2614,6 +2614,37 @@ class DumperControlReqOutput(BaseReq, kw_only=True):
     error: str = ""
 
 
+class TpeTransactionReqInput(BaseReq, kw_only=True):
+    """Unified TPE control transaction request (R8, F4)."""
+
+    op: Literal["drain", "hot_reload", "teardown", "set_admission"]
+    op_id: str
+    job_id: str
+    instance_generation: int
+    expected_artifact_hash: Optional[str] = None
+    artifact_hash: Optional[str] = None
+    code_utf8: Optional[str] = None
+    entry_fn: str = "forward"
+    drain_purpose: Optional[Literal["hot_reload", "teardown"]] = None
+    admission_mode: Optional[Literal["CLOSED", "JOB_ONLY", "BASELINE_PROBE_ONLY"]] = None
+    timeout_s: float = 30.0
+
+
+class TpeTransactionReqOutput(BaseReq, kw_only=True):
+    """Unified TPE control transaction response with generation/responder correlation (F4)."""
+
+    success: bool
+    op: str
+    op_id: str
+    job_id: str
+    instance_generation: int
+    responder_id: str
+    state: str
+    phase_timings_s: Dict[str, float] = msgspec.field(default_factory=dict)
+    canary_summary: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+
+
 # The following request types are either defined in other files,
 # or not subclasses of BaseReq/BaseBatchReq, so we skip the check for them.
 _IGNORE_REQ_TYPES_CHECK = (

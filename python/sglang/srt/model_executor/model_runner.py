@@ -1001,6 +1001,28 @@ class ModelRunner:
         that build bespoke memory pools can reuse it after allocating them."""
         self.init_kv_index_translator()
 
+        # TPE stable dispatch shell MUST be installed BEFORE install_canary()
+        # so kv_canary wraps the stable shell and can never be bypassed by hot reload.
+        import os
+
+        if not self.is_draft_worker and os.environ.get("SGLANG_ENABLE_TPE", "0") == "1":
+            from sglang.srt.model_executor.model_runner_components.hot_reload import (
+                HotReloadManager,
+            )
+            from sglang.srt.model_executor.model_runner_components.tpe_graph_adapter import (
+                TpeGraphAdapter,
+            )
+
+            self.tpe_hot_reload_manager = HotReloadManager(
+                self.model,
+                rank=get_parallel().tp_rank,
+            )
+            self.tpe_hot_reload_manager.install_stable_shell()
+            self.tpe_graph_adapter = TpeGraphAdapter(self)
+        else:
+            self.tpe_hot_reload_manager = None
+            self.tpe_graph_adapter = None
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -1009,6 +1031,44 @@ class ModelRunner:
             model_runner=self,
             token_oracle_manager=self._token_oracle_manager,
         )
+
+    def tpe_hot_reload(
+        self,
+        *,
+        job_id: str,
+        code_utf8: str,
+        artifact_hash: Optional[str] = None,
+        entry_fn: str = "forward",
+    ):
+        """Activate a TPE candidate via the stable shell and recapture decode CUDA graphs."""
+        if self.tpe_hot_reload_manager is None or self.tpe_graph_adapter is None:
+            raise RuntimeError(
+                "TPE is not enabled on this ModelRunner (set SGLANG_ENABLE_TPE=1)."
+            )
+        candidate = self.tpe_hot_reload_manager.load_and_activate(
+            job_id=job_id,
+            code_utf8=code_utf8,
+            artifact_hash=artifact_hash,
+            entry_fn=entry_fn,
+        )
+        stats = self.tpe_graph_adapter.recapture_decode_graphs()
+        return candidate, stats
+
+    def tpe_teardown(self, *, recapture_baseline: bool = True):
+        """Restore baseline dispatch, destroy graphs before freeing candidate state, and recapture."""
+        if self.tpe_hot_reload_manager is None or self.tpe_graph_adapter is None:
+            raise RuntimeError(
+                "TPE is not enabled on this ModelRunner (set SGLANG_ENABLE_TPE=1)."
+            )
+        teardown_error = self.tpe_hot_reload_manager.restore_baseline(
+            destroy_graphs_fn=self.tpe_graph_adapter.destroy_decode_graphs,
+        )
+        stats = (
+            self.tpe_graph_adapter.recapture_decode_graphs()
+            if recapture_baseline and teardown_error is None
+            else None
+        )
+        return teardown_error, stats
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()

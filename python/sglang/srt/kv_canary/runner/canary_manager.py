@@ -289,6 +289,65 @@ class CanaryManager:
             single_forward_manager.phase_checker.enable_assert()
         self._device_state.enable_chain_position_assert.fill_(1)
 
+    @contextlib.contextmanager
+    def recapture_scope(self) -> Iterator[None]:
+        """Suspend synthetic-capture-incompatible GPU asserts during graph recapture (F1).
+
+        Caller must enter only at quiescence (no active forward bracket) and after
+        collecting any prior job violations via `finalize_job_check()`.
+        """
+        assert self._active_single_forward_manager_index is None, (
+            "kv-canary: recapture_scope entered while a SingleForwardManager is active"
+        )
+        assert self._model_forward_bracket_depth == 0, (
+            "kv-canary: recapture_scope entered inside an active model.forward bracket"
+        )
+        for single_forward_manager in self._single_forward_managers:
+            single_forward_manager.phase_checker.disable_assert()
+        self._device_state.enable_chain_position_assert.fill_(0)
+        try:
+            yield
+        finally:
+            self.mark_init_finished()
+
+    def snapshot_kernel_run_counts(self) -> dict[str, int]:
+        counts = self._device_state.kernel_run_counters.detach().to("cpu").tolist()
+        return {tag.name: int(counts[tag.value]) for tag in self._active_tags}
+
+    def finalize_job_check(
+        self,
+        *,
+        run_final_sweep: bool = True,
+        baseline_kernel_counts: Optional[dict[str, int]] = None,
+        raise_on_violation: bool = True,
+    ) -> dict[str, object]:
+        """Explicit job-end verification primitive executed BEFORE cache flush (F2)."""
+        if run_final_sweep:
+            run_sweep_fn = getattr(self._sweep_orchestrator, "run_sweep", None)
+            if callable(run_sweep_fn):
+                run_sweep_fn()
+            else:
+                self._sweep_orchestrator.maybe_run_sweep()
+
+        violations_detected = self._violation_manager.finalize_and_check(
+            raise_on_violation=raise_on_violation
+        )
+        current_counts = self.snapshot_kernel_run_counts()
+        delta_counts = (
+            {
+                k: current_counts.get(k, 0) - baseline_kernel_counts.get(k, 0)
+                for k in current_counts
+            }
+            if baseline_kernel_counts is not None
+            else current_counts
+        )
+        return {
+            "violations_detected": violations_detected,
+            "kernel_run_counts": current_counts,
+            "kernel_run_deltas": delta_counts,
+            "outer_step_counter": self._outer_step_counter,
+        }
+
     def attach_radix_cache(self, radix_cache: BasePrefixCache) -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_manager.attach_radix_cache(radix_cache)

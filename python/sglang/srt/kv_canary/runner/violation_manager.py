@@ -39,6 +39,24 @@ class ViolationManager:
                 outer_step_counter=self._outer_step_counter_getter()
             )
 
+    def finalize_and_check(self, *, raise_on_violation: bool = True) -> bool:
+        """Drain pending D2H future and perform one synchronous final violation check (F2)."""
+        errored = False
+
+        def _consume(host: torch.Tensor) -> None:
+            nonlocal errored
+            errored = errored or bool(int(host.item()))
+
+        self._handler.drain(postprocess_on_host=_consume)
+        final_flag = bool(int(self._compute_on_device().item()))
+        errored = errored or final_flag
+
+        if errored and raise_on_violation and not self._violation_reporter.is_raised:
+            self._violation_reporter.log_or_raise_violation(
+                outer_step_counter=self._outer_step_counter_getter()
+            )
+        return errored
+
     def _compute_on_device(self) -> torch.Tensor:
         violation_log = self._device_state.violation_log
         return (violation_log.violation_write_index > 0).to(torch.uint8).view(-1)[:1]

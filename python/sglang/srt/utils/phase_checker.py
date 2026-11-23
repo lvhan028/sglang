@@ -70,6 +70,12 @@ class SimplePhaseChecker:
         self._enable_assert_device.fill_(1)
         _host_debug(f"[SimplePhaseChecker.enable_assert] assert ENABLED")
 
+    def disable_assert(self) -> None:
+        """Disable the device-side assert and reset phase for graph recapture (F1)."""
+        self._enable_assert_device.fill_(0)
+        self._reset_to_idle()
+        _host_debug(f"[SimplePhaseChecker.disable_assert] assert DISABLED")
+
     def update(
         self,
         *,

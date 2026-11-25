@@ -770,6 +770,193 @@ def gdn_replayssm_compact_commit_kernel(
 
 
 @triton.jit
+def _gdn_replayssm_layered_commit_kernel(
+    h0,
+    d_cache,
+    k_cache,
+    g_cache,
+    d_residual_cache,
+    k_residual_cache,
+    ssm_state_indices,
+    replay_indices,
+    write_pos,
+    cache_base,
+    is_flush_flags,
+    accept_lens,
+    mamba_track_indices,
+    mamba_steps_to_track,
+    stride_state_slot: tl.constexpr,
+    stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_d_residual_slot: tl.constexpr,
+    stride_k_residual_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_d_layer: tl.constexpr,
+    stride_k_layer: tl.constexpr,
+    stride_g_layer: tl.constexpr,
+    stride_d_residual_layer: tl.constexpr,
+    stride_k_residual_layer: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_replay_indices: tl.constexpr,
+    stride_accept: tl.constexpr,
+    stride_track: tl.constexpr,
+    stride_steps: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    NUM_LAYERS: tl.constexpr,
+):
+    """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
+    i_v = tl.program_id(0)
+    i_n = tl.program_id(1)
+    i_hvl = tl.program_id(2)
+    i_hv = i_hvl
+    i_h = i_hv // (HV // H)
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+    replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
+    if state_idx <= NULL_BLOCK_ID:
+        return
+    n_history = tl.load(write_pos + replay_idx).to(tl.int32)
+    fold_active = tl.load(is_flush_flags + replay_idx) != 0
+    if HAS_TRACK:
+        track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
+        track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
+        has_track = (track_idx > NULL_BLOCK_ID) & (track_step >= 0)
+        n_accepted = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
+        track_len = n_history - n_accepted + track_step + 1
+    else:
+        track_idx = NULL_BLOCK_ID
+        has_track = False
+        track_len = 0
+    if (not fold_active) and (not has_track):
+        return
+
+    h0_base = h0
+    d_cache_base = d_cache
+    k_cache_base = k_cache
+    g_cache_base = g_cache
+    d_residual_cache_base = d_residual_cache
+    k_residual_cache_base = k_residual_cache
+    for i_layer_idx in range(NUM_LAYERS):
+        i_layer = i_layer_idx.to(tl.int64)
+        h0 = h0_base + i_layer * stride_state_layer
+        d_cache = d_cache_base + i_layer * stride_d_layer
+        k_cache = k_cache_base + i_layer * stride_k_layer
+        g_cache = g_cache_base + i_layer * stride_g_layer
+        d_residual_cache = d_residual_cache_base + i_layer * stride_d_residual_layer
+        k_residual_cache = k_residual_cache_base + i_layer * stride_k_residual_layer
+        base = tl.load(cache_base + replay_idx).to(tl.int32)
+        o_t = tl.arange(0, MAX_CACHE_LEN)
+        phys = (base + o_t) & (MAX_CACHE_LEN - 1)
+        o_k = tl.arange(0, K)
+        o_v = i_v * BV + tl.arange(0, BV)
+        mask_v = o_v < V
+    
+        p_h0 = (
+            h0
+            + state_idx * stride_state_slot
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+        if HAS_TRACK:
+            old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
+        keys = tl.load(
+            k_cache
+            + replay_idx * stride_k_slot
+            + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+            + o_k[None, :]
+        )
+        if HAS_RESIDUAL:
+            key_residual = tl.load(
+                k_residual_cache
+                + replay_idx * stride_k_residual_slot
+                + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+                + o_k[None, :]
+            )
+        updates = tl.load(
+            d_cache
+            + replay_idx * stride_d_slot
+            + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+            + o_v[None, :],
+            mask=mask_v[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        if HAS_RESIDUAL:
+            updates += tl.load(
+                d_residual_cache
+                + replay_idx * stride_d_residual_slot
+                + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+                + o_v[None, :],
+                mask=mask_v[None, :],
+                other=0.0,
+            ).to(tl.float32)
+        gates = tl.load(
+            g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
+        ).to(tl.float32)
+    
+        if fold_active:
+            active_mask = o_t < n_history
+            active_g = tl.where(active_mask, gates, 0.0)
+            active_prefix = tl.cumsum(active_g, axis=0)
+            active_total = tl.sum(active_g, axis=0)
+            active_decay = tl.where(active_mask, tl.exp(active_total - active_prefix), 0.0)
+            active_updates = updates * active_decay[:, None]
+            active_hi = active_updates.to(k_cache.dtype.element_ty)
+            active_lo = (active_updates - active_hi.to(tl.float32)).to(
+                k_cache.dtype.element_ty
+            )
+            active_delta = tl.dot(tl.trans(keys), active_hi)
+            active_delta += tl.dot(tl.trans(keys), active_lo)
+            if HAS_RESIDUAL:
+                active_delta += tl.dot(tl.trans(key_residual), active_hi)
+                active_delta += tl.dot(tl.trans(key_residual), active_lo)
+            if not HAS_TRACK:
+                old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
+            tl.store(
+                p_h0,
+                (old_state * tl.exp(active_total) + active_delta).to(p_h0.dtype.element_ty),
+                mask=mask_v[None, :],
+            )
+    
+        if HAS_TRACK:
+            if has_track:
+                track_mask = o_t < track_len
+                track_g = tl.where(track_mask, gates, 0.0)
+                track_prefix = tl.cumsum(track_g, axis=0)
+                track_total = tl.sum(track_g, axis=0)
+                track_decay = tl.where(track_mask, tl.exp(track_total - track_prefix), 0.0)
+                track_updates = updates * track_decay[:, None]
+                track_hi = track_updates.to(k_cache.dtype.element_ty)
+                track_lo = (track_updates - track_hi.to(tl.float32)).to(
+                    k_cache.dtype.element_ty
+                )
+                track_delta = tl.dot(tl.trans(keys), track_hi)
+                track_delta += tl.dot(tl.trans(keys), track_lo)
+                if HAS_RESIDUAL:
+                    track_delta += tl.dot(tl.trans(key_residual), track_hi)
+                    track_delta += tl.dot(tl.trans(key_residual), track_lo)
+                tl.store(
+                    h0
+                    + track_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None],
+                    (old_state * tl.exp(track_total) + track_delta).to(h0.dtype.element_ty),
+                    mask=mask_v[None, :],
+                )
+
+
+
+@triton.jit
 def _finish_gdn_replayssm_circular_fold_kernel(
     write_pos,
     cache_base,
@@ -1298,8 +1485,19 @@ def commit_gdn_replayssm_circular(
     has_residual = d_residual_cache is not None and k_residual_cache is not None
     d_residual_buf = d_residual_cache if has_residual else d_cache
     k_residual_buf = k_residual_cache if has_residual else k_cache
-    BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    use_layered = (
+        not has_track
+        and has_residual
+        and num_layers == 30
+        and (H, HV, K, V, max_cache_len) == (16, 32, 128, 128, 16)
+        and checkpoint_state.dtype == torch.float32
+        and d_cache.dtype == torch.bfloat16
+        and k_cache.dtype == torch.bfloat16
+        and d_residual_cache.dtype == torch.bfloat16
+        and k_residual_cache.dtype == torch.bfloat16
+    )
+    BV = 32 if use_layered else min(triton.next_power_of_2(V), 64)
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1310,8 +1508,10 @@ def commit_gdn_replayssm_circular(
         track_steps = accept_lens
         stride_track = 0
         stride_steps = 0
-    grid = (triton.cdiv(V, BV), B, HV * num_layers)
-    gdn_replayssm_compact_commit_kernel[grid](
+    grid = (triton.cdiv(V, BV), B, HV if use_layered else HV * num_layers)
+    kernel = _gdn_replayssm_layered_commit_kernel if use_layered else gdn_replayssm_compact_commit_kernel
+    launch_extra = {"NUM_LAYERS": num_layers} if use_layered else {}
+    kernel[grid](
         checkpoint_state,
         d_cache,
         k_cache,
@@ -1354,6 +1554,7 @@ def commit_gdn_replayssm_circular(
         HAS_RESIDUAL=has_residual,
         num_warps=4,
         num_stages=2,
+        **launch_extra,
     )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](

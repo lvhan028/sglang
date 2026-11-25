@@ -1473,6 +1473,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
             )
 
+        if get_exec().mamba.enable_linear_replayssm_spec:
+            model_runner = self.target_worker.model_runner
+            mamba_pool = getattr(model_runner.req_to_token_pool, "mamba_pool", None)
+            if (
+                getattr(mamba_pool, "replayssm_cache_base", None) is not None
+                and not getattr(mamba_pool, "replayssm_is_kda", False)
+            ):
+                from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+                commit_mamba_states_after_verify(
+                    self.target_worker,
+                    batch,
+                    accept_lens=commit_lens,
+                    accept_index=None,
+                    draft_token_num=self.verify_num_draft_tokens,
+                    prepared_step_indices=(last_correct_step_indices, mamba_steps_to_track),
+                )
+                return
+
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,

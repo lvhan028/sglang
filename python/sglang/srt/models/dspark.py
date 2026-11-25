@@ -975,7 +975,53 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
 
 
 class Qwen3DSparkModel(DSparkDraftModel):
-    pass
+    def __init__(self, config, quant_config=None, prefix=""):
+        super().__init__(config, quant_config, prefix)
+        self._redhat_export = getattr(config, "agent_loop_redhat_export", False)
+        if self._redhat_export:
+            self.checkpoint_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.checkpoint_head = nn.Linear(config.hidden_size, config.draft_vocab_size, bias=False)
+            self.register_buffer(
+                "checkpoint_draft_to_target", torch.empty(config.draft_vocab_size, dtype=torch.int64),
+                persistent=False,
+            )
+
+    def attach_shared_modules(self, *, embed_tokens, lm_head):
+        super().attach_shared_modules(embed_tokens=embed_tokens, lm_head=lm_head)
+        if self._redhat_export:
+            self.embed_tokens = self.checkpoint_embedding
+
+    def compute_base_logits(self, hidden):
+        if not self._redhat_export:
+            return super().compute_base_logits(hidden)
+        reduced = self.checkpoint_head(hidden)
+        output = reduced.new_full((*reduced.shape[:-1], int(self.config.vocab_size)), -torch.inf)
+        output.index_copy_(-1, self.checkpoint_draft_to_target, reduced)
+        return output, hidden
+
+    def load_weights(self, weights):
+        if not self._redhat_export:
+            return super().load_weights(weights)
+        names = ("d2t", "t2d", "embed_tokens.weight", "lm_head.weight", "markov_head.markov_w2.weight")
+        own = {}
+        backbone = []
+        for name, tensor in weights:
+            if name in names:
+                own[name] = tensor
+            else:
+                backbone.append((name, tensor))
+        assert set(own) == set(names)
+        ids = torch.arange(own["d2t"].numel(), dtype=torch.int64) + own["d2t"].cpu()
+        expected = own["t2d"].cpu().nonzero().view(-1)
+        assert torch.equal(ids, expected)
+        self.checkpoint_draft_to_target.copy_(ids)
+        default_weight_loader(self.checkpoint_embedding.weight, own["embed_tokens.weight"])
+        default_weight_loader(self.checkpoint_head.weight, own["lm_head.weight"])
+        w2 = own["markov_head.markov_w2.weight"]
+        expanded = w2.new_zeros((self.config.vocab_size, w2.shape[1]))
+        expanded.index_copy_(0, ids.to(w2.device), w2)
+        backbone.append(("markov_head.markov_w2.weight", expanded))
+        return super().load_weights(backbone)
 
 
 class LingDSparkModel(DSparkDraftModel):

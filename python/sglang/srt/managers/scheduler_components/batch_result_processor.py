@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -15,6 +18,7 @@ from typing import (
 import numpy as np
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
@@ -82,6 +86,47 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_B0_TRACE_PATH = os.environ.get("AGENT_LOOP_B0_DECODE_TRACE")
+_b0_trace = None
+
+
+def _b0_snapshot(batch):
+    if _B0_TRACE_PATH:
+        return [
+            (req, len(req.output_ids_through_stop))
+            for req in batch.reqs
+            if not req.finished() and not req.is_retracted
+            and not req.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+        ]
+    return []
+
+
+def _b0_record(processor, batch, before, *, decode):
+    global _b0_trace
+    if not before:
+        return
+    if _b0_trace is None:
+        from sglang._flag_ab_provenance import record
+        record(force=True)
+        _b0_trace = open(_B0_TRACE_PATH, "a", encoding="utf-8", buffering=65536)
+    record = {"event": "decode" if decode else "handoff", "time": time.monotonic()}
+    if decode:
+        record["launch"] = batch.launch_ts
+        record["committed"] = sum(len(req.output_ids_through_stop) - old for req, old in before)
+        record["active"] = len(before)
+        record["ready"] = len(processor.metrics_reporter.scheduler.waiting_queue)
+    else:
+        record["handoffs"] = [(req.rid, count) for req, count in before]
+    finished = [
+        (req.rid, len(req.output_ids_through_stop), req.finished_reason.to_json()["type"])
+        for req, _ in before if req.finished()
+    ]
+    if finished:
+        record["finished"] = finished
+    _b0_trace.write(json.dumps(record, separators=(",", ":")) + "\n")
+    if finished:
+        _b0_trace.flush()
+
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
@@ -115,6 +160,7 @@ class SchedulerBatchResultProcessor:
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
+        b0_before = _b0_snapshot(batch)
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
@@ -132,6 +178,8 @@ class SchedulerBatchResultProcessor:
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
+
+        _b0_record(self, batch, b0_before, decode=False)
 
     def _maybe_collect_routed_experts(self, req: Req):
         """Collect routed experts for a finished request.
@@ -954,6 +1002,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        b0_before = _b0_snapshot(batch)
         if result.copy_done is not None:
             result.copy_done.synchronize()
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
@@ -1107,6 +1156,8 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_generated_tokens=num_generated_tokens,
         )
+
+        _b0_record(self, batch, b0_before, decode=True)
 
     def _normalize_decode_outputs(
         self,

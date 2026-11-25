@@ -638,7 +638,7 @@ def _zmq_addr_for(port_args) -> str:
         c if c.isalnum() or c in "._-" else "_" for c in port_args.instance_id
     )
     digest = hashlib.blake2s(port_args.instance_id.encode(), digest_size=4).hexdigest()
-    return f"ipc:///tmp/sglang_load_collector_{safe}_{digest}.sock"
+    return f"ipc:///nvmedata/lvhan/tmp/q.4psn0bv8/sglang_load_collector_{safe}_{digest}.sock"
 
 
 def create_load_snapshot_writer(

@@ -1006,7 +1006,7 @@ def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
     accept_lens: torch.Tensor,
-    accept_index: torch.Tensor,
+    accept_index: Optional[torch.Tensor],
     draft_token_num: int,
     prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
 ) -> None:
@@ -1035,6 +1035,13 @@ def commit_mamba_states_after_verify(
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
+    if accept_index is None:
+        assert prepared_step_indices is not None
+        assert getattr(mamba_pool, "replayssm_cache_base", None) is not None
+        assert not getattr(mamba_pool, "replayssm_is_kda", False)
+    has_accepted_rows = (
+        accept_lens.numel() > 0 if accept_index is None else accept_index.numel() > 0
+    )
     bs = accept_lens.shape[0]
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
@@ -1048,7 +1055,7 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        if batch.forward_mode.is_idle() or not has_accepted_rows:
             return
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
@@ -1084,7 +1091,7 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_cache_base", None) is not None
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        if batch.forward_mode.is_idle() or not has_accepted_rows:
             return
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,

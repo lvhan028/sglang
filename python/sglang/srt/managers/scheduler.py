@@ -4637,6 +4637,8 @@ class Scheduler(
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
+        from sglang.srt.managers import scbench_nsys_metrics_gate
+        observe_metrics = scbench_nsys_metrics_gate.before(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -4931,6 +4933,8 @@ class Scheduler(
                 self._pending_chunked_abort_req = self.chunked_req
 
         self._maybe_report_active_ranks()
+        if observe_metrics:
+            scbench_nsys_metrics_gate.after(batch)
 
         return ret
 

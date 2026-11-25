@@ -107,4 +107,7 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         resolved_kv_cache_dtype = "auto"
 
+    from sglang._flag_ab_provenance import record
+    record()
+    logger.info("Measured KV cache dtype: %s draft=%s", kv_cache_dtype, is_draft_worker)
     return resolved_kv_cache_dtype, kv_cache_dtype

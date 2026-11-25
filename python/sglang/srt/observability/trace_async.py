@@ -146,7 +146,7 @@ def start_trace_exporter(
         if _exporter_process is not None and _exporter_process.is_alive():
             return True
 
-        zmq_endpoint = f"ipc:///tmp/sglang_trace_{os.getpid()}.sock"
+        zmq_endpoint = f"ipc:///nvmedata/lvhan/tmp/q.4psn0bv8/sglang_trace_{os.getpid()}.sock"
 
         _zmq_endpoint = zmq_endpoint
         _zmq_context = zmq.Context()

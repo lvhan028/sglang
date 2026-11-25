@@ -29,5 +29,6 @@ def record(force=False):
     out = Path(os.environ['SCBENCH_PROVENANCE_DIR'])
     out.mkdir(exist_ok=True)
     (out / f'{data["role"]}-{os.getpid()}.json').write_text(json.dumps(data, indent=2) + '\n')
-    assert os.geteuid() == 0 and not leaked, data
+    if os.geteuid() != 0 or leaked:
+        raise RuntimeError(f'Source admission failed: euid={os.geteuid()}, leaked={leaked}')
     _recorded = True

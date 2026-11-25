@@ -88,6 +88,7 @@ logger = logging.getLogger(__name__)
 
 _B0_TRACE_PATH = os.environ.get("AGENT_LOOP_B0_DECODE_TRACE")
 _b0_trace = None
+_model_sampling_recorded = False
 
 
 def _b0_snapshot(batch):
@@ -102,13 +103,22 @@ def _b0_snapshot(batch):
 
 
 def _b0_record(processor, batch, before, *, decode):
-    global _b0_trace
+    global _b0_trace, _model_sampling_recorded
     if not before:
         return
     if _b0_trace is None:
         from sglang._flag_ab_provenance import record
         record(force=True)
         _b0_trace = open(_B0_TRACE_PATH, "a", encoding="utf-8", buffering=65536)
+    if decode and not _model_sampling_recorded:
+        formal = [req for req, old in before if req.rid.startswith("flag-ab-") and req.rid != "flag-ab-warmup"]
+        if formal:
+            expected = json.loads(os.environ["SCBENCH_REQUIRED_MODEL_SAMPLING"])
+            values = [{"rid": req.rid, **{key: getattr(req.sampling_params, key) for key in expected}} for req in formal]
+            assert all(all(row[key] == value for key,value in expected.items()) for row in values), values
+            from pathlib import Path
+            Path(_B0_TRACE_PATH).with_name("effective-model-sampling.json").write_text(json.dumps({"expected": expected, "observed": values}, indent=2)+"\n")
+            _model_sampling_recorded = True
     record = {"event": "decode" if decode else "handoff", "time": time.monotonic()}
     if decode:
         record["launch"] = batch.launch_ts

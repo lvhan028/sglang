@@ -1514,6 +1514,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Pack the Q and K projections into adjacent MMA columns at B160.
                 verify_block_v, verify_warps, verify_stages = 128, 2, 3
                 pack_qk = True
+                if envs.SGLANG_OPT_GDN_REPLAYSSM_B300_K16.get():
+                    # The K16/V64 tile lowers per-CTA register and shared
+                    # memory usage enough for a four-stage pipeline.
+                    verify_nk = 8
+                    verify_block_v, verify_warps, verify_stages = 64, 1, 4
         gdn_replayssm_spec_decode(
             q=q,
             k=k,

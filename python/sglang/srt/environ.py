@@ -596,6 +596,8 @@ class Envs:
     SGLANG_OPT_GDN_REPLAYSSM_B300_K16 = EnvBool(False)
     SGLANG_OPT_GDN_CONV1D_Q4 = EnvBool(False)
     SGLANG_OPT_GDN_VERIFY_PROJECTION_VIEWS = EnvBool(False)
+    # Use two warps and two winner reductions for full-batch Qwen Markov sampling.
+    SGLANG_OPT_DSPARK_B300_MARKOV_REDUCE = EnvBool(False)
     SGLANG_OPT_GDN_B300_MMA_FOLD_ACC = EnvBool(False)
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)
     # in one Triton launch instead of four copies and a fill.

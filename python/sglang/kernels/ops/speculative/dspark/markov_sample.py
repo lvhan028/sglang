@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -59,6 +60,7 @@ def _markov_sample_partial_kernel(
     SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    TWO_REDUCTIONS: tl.constexpr,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     i = part * BLOCK + tl.arange(0, BLOCK)
@@ -87,6 +89,7 @@ def _markov_sample_partial_kernel(
             BLOCK,
             SAMPLE,
             PHILOX_ROUNDS,
+            TWO_REDUCTIONS,
         )
 
 
@@ -107,6 +110,7 @@ def _select_block(
     BLOCK: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    TWO_REDUCTIONS: tl.constexpr,
 ):
     key = value
     if SAMPLE:
@@ -131,11 +135,24 @@ def _select_block(
         exp_noise = -libdevice.log1p(-uniform)
         key = value / temperature - tl.log(exp_noise)
     nan = valid & (key != key)
-    has_nan = tl.sum(nan.to(tl.int32), 0) > 0
-    maximum = tl.max(tl.where(valid & ~nan, key, -float("inf")), 0)
-    wins = tl.where(has_nan, nan, valid & (key == maximum))
-    idx = tl.min(tl.where(wins, i + VOCAB_START, _NO_INDEX), 0)
-    maximum = tl.where(has_nan, float("nan"), maximum)
+    if TWO_REDUCTIONS:
+        # Include NaNs in the max as +Inf, then give their token ids priority
+        # over real +Inf when reducing the candidates. The remaining bits keep
+        # smallest-token tie breaking, including across multiple NaNs.
+        rank = tl.where(nan, float("inf"), tl.where(valid, key, -float("inf")))
+        best = tl.max(rank, 0)
+        wins = valid & (nan | (key == best))
+        token_id = (i + VOCAB_START).to(tl.int32)
+        ordered_id = tl.where(nan, token_id ^ (-2147483648), token_id)
+        winner = tl.min(tl.where(wins, ordered_id, _NO_INDEX), 0)
+        idx = winner & _NO_INDEX
+        maximum = tl.where(winner < 0, float("nan"), best)
+    else:
+        has_nan = tl.sum(nan.to(tl.int32), 0) > 0
+        maximum = tl.max(tl.where(valid & ~nan, key, -float("inf")), 0)
+        wins = tl.where(has_nan, nan, valid & (key == maximum))
+        idx = tl.min(tl.where(wins, i + VOCAB_START, _NO_INDEX), 0)
+        maximum = tl.where(has_nan, float("nan"), maximum)
     tl.store(P + (row * PARTS + part) * 2, maximum)
     tl.store(P + (row * PARTS + part) * 2 + 1, idx.to(tl.float32, bitcast=True))
 
@@ -208,6 +225,18 @@ def _launch_partial(
     rows, padded = base_logits.shape
     # The padded width fixes the transport shape on every rank; WIDTH masks padding.
     parts = triton.cdiv(padded, _BLOCK)
+    use_b300_markov_reduce = (
+        rows == 160
+        and width == padded == 248320
+        and vocab_start == 0
+        and select
+        and bias is not None
+        and store is not None
+        and has_sampled_rows is not False
+        and envs.SGLANG_OPT_DSPARK_B300_MARKOV_REDUCE.get()
+        and torch.version.cuda is not None
+        and torch.cuda.get_device_capability(base_logits.device) == (10, 3)
+    )
     assert parts > 0
     partial = torch.empty(
         (rows, parts, 2), device=base_logits.device, dtype=torch.float32
@@ -235,7 +264,8 @@ def _launch_partial(
         select,
         has_sampled_rows is not False,
         _PHILOX_ROUNDS,
-        num_warps=4,
+        use_b300_markov_reduce,
+        num_warps=2 if use_b300_markov_reduce else 4,
     )
     return partial.view(rows, parts * 2)
 

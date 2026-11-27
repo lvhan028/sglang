@@ -44,6 +44,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
@@ -841,6 +842,7 @@ def _gdn_replayssm_layered_commit_kernel(
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
     NUM_LAYERS: tl.constexpr,
+    SEED_MMA_ACC: tl.constexpr,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -943,16 +945,30 @@ def _gdn_replayssm_layered_commit_kernel(
             active_lo = (active_updates - active_hi.to(tl.float32)).to(
                 k_cache.dtype.element_ty
             )
-            active_delta = tl.dot(tl.trans(keys), active_hi)
-            active_delta += tl.dot(tl.trans(keys), active_lo)
-            if HAS_RESIDUAL:
-                active_delta += tl.dot(tl.trans(key_residual), active_hi)
-                active_delta += tl.dot(tl.trans(key_residual), active_lo)
-            if not HAS_TRACK:
-                old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
+            if SEED_MMA_ACC:
+                tl.static_assert(not HAS_TRACK)
+                old_state = tl.load(
+                    p_h0, mask=mask_v[None, :], other=0.0
+                ).to(tl.float32)
+                folded = tl.dot(
+                    tl.trans(keys), active_hi, acc=old_state * tl.exp(active_total)
+                )
+                folded = tl.dot(tl.trans(keys), active_lo, acc=folded)
+                if HAS_RESIDUAL:
+                    folded = tl.dot(tl.trans(key_residual), active_hi, acc=folded)
+                    folded = tl.dot(tl.trans(key_residual), active_lo, acc=folded)
+            else:
+                active_delta = tl.dot(tl.trans(keys), active_hi)
+                active_delta += tl.dot(tl.trans(keys), active_lo)
+                if HAS_RESIDUAL:
+                    active_delta += tl.dot(tl.trans(key_residual), active_hi)
+                    active_delta += tl.dot(tl.trans(key_residual), active_lo)
+                if not HAS_TRACK:
+                    old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
+                folded = old_state * tl.exp(active_total) + active_delta
             tl.store(
                 p_h0,
-                (old_state * tl.exp(active_total) + active_delta).to(p_h0.dtype.element_ty),
+                folded.to(p_h0.dtype.element_ty),
                 mask=mask_v[None, :],
             )
     
@@ -1543,7 +1559,20 @@ def commit_gdn_replayssm_circular(
         stride_steps = 0
     grid = (triton.cdiv(V, BV), B, HV if use_layered else HV * num_layers)
     kernel = _gdn_replayssm_layered_commit_kernel if use_layered else gdn_replayssm_compact_commit_kernel
-    launch_extra = {"NUM_LAYERS": num_layers} if use_layered else {}
+    launch_extra = {}
+    if use_layered:
+        # Seeding the MMA accumulator changes FP32 summation order. Keep this
+        # specialization opt-in and within the measured B300 full-batch shape.
+        launch_extra = {
+            "NUM_LAYERS": num_layers,
+            "SEED_MMA_ACC": (
+                envs.SGLANG_OPT_GDN_B300_MMA_FOLD_ACC.get()
+                and B == 160
+                and checkpoint_state.is_cuda
+                and torch.version.cuda is not None
+                and torch.cuda.get_device_capability(checkpoint_state.device) == (10, 3)
+            ),
+        }
     kernel[grid](
         checkpoint_state,
         d_cache,

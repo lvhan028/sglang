@@ -594,6 +594,7 @@ class Envs:
     SGLANG_OPT_GDN_REPLAYSSM_B300_PACK_QK = EnvBool(False)
     SGLANG_OPT_GDN_CONV1D_Q4 = EnvBool(False)
     SGLANG_OPT_GDN_VERIFY_PROJECTION_VIEWS = EnvBool(False)
+    SGLANG_OPT_GDN_B300_MMA_FOLD_ACC = EnvBool(False)
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)
     # in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(False)

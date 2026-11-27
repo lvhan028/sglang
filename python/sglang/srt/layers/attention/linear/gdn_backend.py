@@ -648,6 +648,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             draft_token_num=forward_batch.spec_info.draft_token_num,
         )
 
+    @property
+    def accepts_target_verify_projection_views(self) -> bool:
+        return (
+            get_exec().mamba.enable_linear_replayssm_spec
+            and self._use_strided_target_verify_qkv
+        )
+
     def _replayssm_fold_uses_cutedsl(
         self, ssm_dtype: torch.dtype, draft_token_num: int
     ) -> bool:

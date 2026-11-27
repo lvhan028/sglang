@@ -1001,9 +1001,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
-        use_strided_prefill_z = False
+        use_projection_views = False
         packed_verify = False
-        if forward_batch.forward_mode.is_target_verify():
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        if is_target_verify:
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
             backend = get_attn_backend()
@@ -1032,15 +1033,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            # The strided views feed only prefill GDN; DP-relabeled decode rows
-            # run the decode kernels, so pick the layout from the logical mode.
-            use_strided_prefill_z = (
-                _is_cuda
-                and forward_batch.logical_forward_mode.is_extend_without_speculative()
+            # DP-relabeled decode rows use the logical mode for layout routing.
+            # ReplaySSM's Triton verify also accepts views on the measured B160/Q4 shape.
+            use_projection_views = _is_cuda and (
+                forward_batch.logical_forward_mode.is_extend_without_speculative()
+                or (
+                    is_target_verify
+                    and envs.SGLANG_OPT_GDN_VERIFY_PROJECTION_VIEWS.get()
+                    and getattr(backend, "accepts_target_verify_projection_views", False)
+                    and forward_batch.spec_info.draft_token_num == 4
+                    and self.attn_tp_size == 1
+                    and (num_k_heads_tp, num_v_heads_tp) == (16, 32)
+                    and self.head_k_dim == self.head_v_dim == 128
+                    and projected_states_qkvz.shape[0] == 640
+                    and torch.cuda.get_device_capability(projected_states_qkvz.device)
+                    == (10, 3)
+                )
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
-                if use_strided_prefill_z
+                if use_projection_views
                 else fused_qkvzba_split_reshape_cat_contiguous
             )
             mixed_qkv, z, b, a = split_fn(
@@ -1082,7 +1094,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        if use_strided_prefill_z:
+        if use_projection_views:
             z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
         else:
             z = z.reshape(-1, z.shape[-1])
@@ -1095,7 +1107,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
-        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+        if not use_projection_views and _fp8_tuple_input(self.out_proj, len(z) // nv):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
                 self.norm.weight,

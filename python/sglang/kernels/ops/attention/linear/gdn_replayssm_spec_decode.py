@@ -109,7 +109,10 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    PACK_QK: tl.constexpr = False,
 ):
+    if PACK_QK:
+        tl.static_assert(STATE_FP32 and not IS_FLUSH)
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
     i_hv = tl.program_id(2)
@@ -246,13 +249,22 @@ def gdn_replayssm_spec_circular_kernel(
     # ------------------------------------------------------------------
     # K-Tiled Fused Projection and Intra-Spec Matrices (+ flush)
     # ------------------------------------------------------------------
-    hw_q = tl.zeros([BV, BS], dtype=tl.float32)
-    hw_k = tl.zeros([BV, BS], dtype=tl.float32)
+    if PACK_QK:
+        hw_qk = tl.zeros([BV, 2 * BS], dtype=tl.float32)
+    else:
+        hw_q = tl.zeros([BV, BS], dtype=tl.float32)
+        hw_k = tl.zeros([BV, BS], dtype=tl.float32)
     if not IS_FLUSH:
-        scores_q = tl.zeros([BC, BS], dtype=tl.float32)
-        scores_k = tl.zeros([BC, BS], dtype=tl.float32)
-    kk_mat = tl.zeros([BS, BS], dtype=tl.float32)
-    kq_mat = tl.zeros([BS, BS], dtype=tl.float32)
+        if PACK_QK:
+            scores_qk = tl.zeros([BC, 2 * BS], dtype=tl.float32)
+        else:
+            scores_q = tl.zeros([BC, BS], dtype=tl.float32)
+            scores_k = tl.zeros([BC, BS], dtype=tl.float32)
+    if PACK_QK:
+        gram_qk = tl.zeros([BS, 2 * BS], dtype=tl.float32)
+    else:
+        kk_mat = tl.zeros([BS, BS], dtype=tl.float32)
+        kq_mat = tl.zeros([BS, BS], dtype=tl.float32)
 
     write_k = (i_v == 0) and (i_hv == i_h * (HV // H))
 
@@ -304,8 +316,13 @@ def gdn_replayssm_spec_circular_kernel(
 
         qT = tl.trans(q_tile)
         kT = tl.trans(k_tile)
-        kk_mat += tl.dot(k_tile, kT, input_precision=DOT_PRECISION)
-        kq_mat += tl.dot(k_tile, qT, input_precision=DOT_PRECISION)
+        if PACK_QK:
+            qkT = tl.interleave(qT, kT)
+        if PACK_QK:
+            gram_qk += tl.dot(k_tile, qkT, input_precision=DOT_PRECISION)
+        else:
+            kk_mat += tl.dot(k_tile, kT, input_precision=DOT_PRECISION)
+            kq_mat += tl.dot(k_tile, qT, input_precision=DOT_PRECISION)
         if STORE_K_RESIDUAL and not STATE_FP32:
             k_residual_T = tl.trans(k_residual_tile)
             kk_mat += tl.dot(k_tile, k_residual_T, input_precision=DOT_PRECISION)
@@ -320,8 +337,11 @@ def gdn_replayssm_spec_circular_kernel(
         # the whole non-window contribution and no d-fold happens here anymore.
         if STATE_FP32:
             sc_tile = sc_tile.to(tl.float32)
-            hw_q += tl.dot(sc_tile, qT, input_precision=DOT_PRECISION)
-            hw_k += tl.dot(sc_tile, kT, input_precision=DOT_PRECISION)
+            if PACK_QK:
+                hw_qk += tl.dot(sc_tile, qkT, input_precision=DOT_PRECISION)
+            else:
+                hw_q += tl.dot(sc_tile, qT, input_precision=DOT_PRECISION)
+                hw_k += tl.dot(sc_tile, kT, input_precision=DOT_PRECISION)
         else:
             sc_tile = sc_tile.to(k_tile.dtype)
             hw_q += tl.dot(sc_tile, qT)
@@ -343,8 +363,11 @@ def gdn_replayssm_spec_circular_kernel(
                 khist_tile = khist_tile.to(tl.float32)
             else:
                 khist_tile = khist_tile.to(k_cache.dtype.element_ty)
-            scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
-            scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
+            if PACK_QK:
+                scores_qk += tl.dot(khist_tile, qkT, input_precision=DOT_PRECISION)
+            else:
+                scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
+                scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
 
         if write_k:
             spec_kt_mask = (
@@ -378,7 +401,13 @@ def gdn_replayssm_spec_circular_kernel(
                 mask=spec_kt_mask,
             )
 
+    if PACK_QK:
+        hw_q, hw_k = tl.split(hw_qk.reshape(BV, BS, 2))
+    if PACK_QK:
+        kq_mat, kk_mat = tl.split(gram_qk.reshape(BS, BS, 2))
     if not IS_FLUSH:
+        if PACK_QK:
+            scores_q, scores_k = tl.split(scores_qk.reshape(BC, BS, 2))
         hw_q = b_total_decay * hw_q + tl.dot(
             b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
         )
@@ -1096,6 +1125,7 @@ def _launch_gdn_spec(
     bs_min,
     null_block_id,
     dot_precision,
+    pack_qk=False,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1186,6 +1216,7 @@ def _launch_gdn_spec(
         IS_FLUSH=is_flush_kernel,
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
+        PACK_QK=pack_qk,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1289,6 +1320,7 @@ def gdn_replayssm_spec_decode(
     num_stages_flush: int = 2,
     nk_flush: int = 2,
     launch_mode: str = "both",
+    pack_qk: bool = False,
     # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
 ):
@@ -1378,6 +1410,7 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            pack_qk,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(

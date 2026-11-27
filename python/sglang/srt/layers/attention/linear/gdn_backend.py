@@ -1486,6 +1486,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
         verify_nk = 2
+        verify_block_v = 64
+        verify_warps = 1
+        verify_stages = 2
+        pack_qk = False
         if (
             envs.SGLANG_OPT_GDN_REPLAYSSM_B300_VERIFY.get()
             and (H, HV, K, V, max_cache_len, draft_token_num) == (16, 32, 128, 128, 16, 4)
@@ -1499,6 +1503,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ):
             # Smaller K tiles reduce the verify kernel's register working set.
             verify_nk = 4
+            if envs.SGLANG_OPT_GDN_REPLAYSSM_B300_PACK_QK.get():
+                # Pack the Q and K projections into adjacent MMA columns at B160.
+                verify_block_v, verify_warps, verify_stages = 128, 2, 3
+                pack_qk = True
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
@@ -1536,7 +1544,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             nk=verify_nk,
+            block_v=verify_block_v,
+            num_warps=verify_warps,
+            num_stages=verify_stages,
             launch_mode="verify",
+            pack_qk=pack_qk,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

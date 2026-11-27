@@ -36,6 +36,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 )
 from sglang.kernels.ops.speculative.dspark.sparse_topk_rejection import (
     can_fuse_b300_top_p,
+    can_select_b300_bf16_topk,
     select_b300_topk,
     sparse_topk_rejection,
 )
@@ -342,9 +343,30 @@ class TargetVerifyExecutor:
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
+        logits = result.logits_output.next_token_logits
+        if logits is not None and can_select_b300_bf16_topk(logits, 20):
+            # The captured graph is independent of per-request sampling settings.
+            # Restore the usual FP32 logits before modifying them or exposing them
+            # to consumers that require the full distribution.
+            if not (
+                sampling_info is not None
+                and not sampling_info.is_any_greedy
+                and sampling_info.need_top_k_sampling
+                and sampling_info.sampling_mask_batch_indices is None
+                and draft_input.unit_temperature
+                and draft_input.uniform_top_k_value == draft_input.max_top_k == 20
+                and self._simulated_correct_len is None
+                and not self._block_verification
+                and not batch.return_logprob
+                and not batch.has_grammar
+                and verify_logits_adjustments_are_noop(sampling_info)
+            ):
+                logits = logits.float()
+                result.logits_output.next_token_logits = logits
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
-                next_token_logits=result.logits_output.next_token_logits,
+                next_token_logits=logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
             )
@@ -1299,7 +1321,14 @@ def accept_draft_tokens(
         )
     ):
         scaled_logits = target_logits
-        if not draft_input.unit_temperature or target_logits.dtype != torch.float32:
+        use_bf16_topk = (
+            draft_input.unit_temperature
+            and draft_input.uniform_top_k_value == max_top_k
+            and can_select_b300_bf16_topk(target_logits, max_top_k)
+        )
+        if not draft_input.unit_temperature or (
+            target_logits.dtype != torch.float32 and not use_bf16_topk
+        ):
             temperatures = torch.repeat_interleave(
                 sampling_info.temperatures, verify_num_draft_tokens, dim=0
             )
@@ -1337,6 +1366,9 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             target_top_ps=sampling_info.top_ps if fused_top_p else None,
         )
+
+    if can_select_b300_bf16_topk(target_logits, 20):
+        target_logits = target_logits.float()
 
     if _blockwise_rejection_applies(
         sampling_info=sampling_info,

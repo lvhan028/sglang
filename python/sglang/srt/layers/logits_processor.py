@@ -67,6 +67,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils.common import (
     is_cpu,
@@ -1048,6 +1049,23 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits(
                 "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
             )
+
+        if (
+            envs.SGLANG_OPT_DSPARK_B300_BF16_TARGET_TOPK.get()
+            and logits_metadata.forward_mode.is_target_verify()
+            and get_spec().speculative_algorithm == "DSPARK"
+            and envs.SGLANG_RAGGED_VERIFY_MODE.get() == "static"
+            and not self.final_logit_softcapping
+            and not self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and logits.shape[-1] == self.vocab_size
+        ):
+            from sglang.kernels.ops.speculative.dspark.sparse_topk_rejection import (
+                can_select_b300_bf16_topk,
+            )
+
+            if can_select_b300_bf16_topk(logits, 20):
+                return logits
 
         fuse_cast_softcap = (
             self.final_logit_softcapping

@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 
 try:
     from flashinfer import __version__ as _flashinfer_version
@@ -15,13 +17,32 @@ except ImportError:
     _flashinfer_top_k = None
 
 
+def can_select_b300_bf16_topk(logits: torch.Tensor, k: int) -> bool:
+    return (
+        envs.SGLANG_OPT_DSPARK_B300_BF16_TARGET_TOPK.get()
+        and envs.SGLANG_OPT_DSPARK_B300_FLASHINFER_TOPK.get()
+        and envs.SGLANG_OPT_DSPARK_SPARSE_TOPK_REJECTION.get()
+        and _flashinfer_version == "0.7.3"
+        and k == 20
+        and logits.dtype == torch.bfloat16
+        and logits.shape == (640, 248320)
+        and logits.is_contiguous()
+        and logits.is_cuda
+        and torch.version.cuda is not None
+        and torch.cuda.get_device_capability(logits.device) == (10, 3)
+    )
+
+
 def select_b300_topk(
     logits: torch.Tensor, k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select the same support as the pinned CUDA multiblock Top-K."""
     if (
         _flashinfer_top_k is None
-        or logits.dtype != torch.float32
+        or (
+            logits.dtype != torch.float32
+            and not can_select_b300_bf16_topk(logits, k)
+        )
         or logits.shape != (640, 248320)
         or not logits.is_contiguous()
         or not logits.is_cuda
@@ -34,16 +55,18 @@ def select_b300_topk(
     # Torch 2.14's CUDA multiblock gather selects lower token IDs when a
     # tie crosses the K boundary. Order within the selected equal logits
     # can differ. Top-p thresholds by value and the final CDF sorts by ID.
-    return _flashinfer_top_k(
+    values, indices = _flashinfer_top_k(
         logits, k, sorted=True, deterministic=True, tie_break=TopKTieBreak.SMALL
     )
+    # Widen only the selected values: temperature and top-p always use FP32.
+    return values.float(), indices
 
 
 def can_fuse_b300_top_p(logits: torch.Tensor, k: int) -> bool:
     return (
         _flashinfer_version == "0.7.3"
         and k == 20
-        and logits.dtype == torch.float32
+        and (logits.dtype == torch.float32 or can_select_b300_bf16_topk(logits, k))
         and logits.shape == (640, 248320)
         and logits.is_cuda
         and torch.version.cuda is not None

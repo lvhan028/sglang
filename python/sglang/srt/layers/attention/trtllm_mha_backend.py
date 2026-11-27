@@ -172,6 +172,8 @@ class TRTLLMMHAMetadata:
     fmha_v2_block_table: torch.Tensor = None
     # Per-forward memoization of pre-expanded [B, 2, M] fmha_v2 block tables
     fmha_v2_block_tables: Optional[dict] = None
+    # Full-KV request order and page tables shared by the B300 B160 verify layers.
+    b300_prefix_groups: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -1242,6 +1244,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     )
                 )
 
+    @staticmethod
+    def _group_b300_shared_prefix_pages(
+        page_table: torch.Tensor, seq_lens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # A shared page at this depth identifies a long cached prefix.
+        keys = torch.where(
+            seq_lens >= 513 * 64,
+            page_table[:, 512],
+            torch.iinfo(torch.int32).max,
+        )
+        order = torch.argsort(keys, stable=True)
+        return order, page_table.index_select(0, order), seq_lens.index_select(0, order)
+
+    def _init_b300_shared_prefix_groups(
+        self, metadata: TRTLLMMHAMetadata, forward_mode: ForwardMode
+    ) -> None:
+        if (
+            getattr(self, "use_b300_shared_prefix_groups", False)
+            and forward_mode.is_target_verify()
+            and not metadata.is_ragged_verify
+            and metadata.max_seq_len_q == 4
+            and metadata.page_table.shape[0] == 160
+            and metadata.page_table.shape[1] > 512
+        ):
+            metadata.b300_prefix_groups = self._group_b300_shared_prefix_pages(
+                metadata.page_table, metadata.cache_seqlens_int32
+            )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
@@ -1250,6 +1280,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+        )
+        # The graph refreshes the full-KV page table before grouping it.
+        self._init_b300_shared_prefix_groups(
+            self.forward_metadata, forward_batch.forward_mode
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1412,6 +1446,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
+        self._init_b300_shared_prefix_groups(metadata, forward_batch.forward_mode)
         self.forward_metadata = metadata
 
     def _init_fmha_v2_batch_pages(
@@ -1568,15 +1603,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 and window_left < 0
                 and sinks is None
             ):
-                # A shared page at this depth identifies a long cached prefix.
-                # Sort only the FMHA inputs, then restore the original request
-                # order before any downstream verify or sampling operation.
-                keys = torch.where(
-                    seq_lens >= 513 * 64,
-                    block_tables[:, 512],
-                    torch.iinfo(torch.int32).max,
-                )
-                order = torch.argsort(keys, stable=True)
+                metadata = getattr(self, "forward_metadata", None)
+                if (
+                    metadata is not None
+                    and metadata.b300_prefix_groups is not None
+                    and block_tables is metadata.page_table
+                    and seq_lens is metadata.cache_seqlens_int32
+                ):
+                    order, grouped_tables, grouped_lens = metadata.b300_prefix_groups
+                else:
+                    order, grouped_tables, grouped_lens = (
+                        self._group_b300_shared_prefix_pages(block_tables, seq_lens)
+                    )
                 q_by_request = query.view(160, 4, 16, 256)
                 # Gather FP8 values bytewise; index_select support varies by dtype.
                 grouped_query = (
@@ -1585,8 +1623,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     .view(query.dtype)
                     .view_as(query)
                 )
-                grouped_tables = block_tables.index_select(0, order)
-                grouped_lens = seq_lens.index_select(0, order)
                 grouped_out = torch.empty_like(output)
                 for lo in range(0, 160, 32):
                     hi = lo + 32

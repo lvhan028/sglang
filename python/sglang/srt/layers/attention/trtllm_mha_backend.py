@@ -413,6 +413,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        self.use_b300_contiguous_verify = (
+            envs.SGLANG_OPT_TRTLLM_MHA_B300_B160_SLICES.get()
+            and self.decode_seq_len_splits == 1
+            and self.page_size == 64
+            and config.get_num_kv_heads(get_parallel().attn_tp_size) == 2
+            and torch.device(self.device).type == "cuda"
+            and torch.version.cuda is not None
+            and torch.cuda.get_device_capability(self.device) == (10, 3)
+        )
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
@@ -1528,6 +1537,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         num_requests = seq_lens.shape[0]
+        if (
+            getattr(self, "use_b300_contiguous_verify", False)
+            and num_requests == 160
+            and q_len_per_req == 4
+            and query.shape == (640, 16, 256)
+            and query.dtype == torch.float8_e4m3fn
+            and resolved_out_dtype == torch.bfloat16
+            and query.is_contiguous()
+            and (out is None or out.is_contiguous())
+            and mask is None
+            and kv_cache_sf is None
+        ):
+            # Lay out three single-wave launches without moving request rows.
+            output = (
+                out
+                if out is not None
+                else torch.empty_like(query, dtype=resolved_out_dtype)
+            )
+            for lo, hi in ((0, 54), (54, 107), (107, 160)):
+                first, last = lo * q_len_per_req, hi * q_len_per_req
+                run_group(
+                    query[first:last],
+                    block_tables[lo:hi],
+                    seq_lens[lo:hi],
+                    output[first:last],
+                )
+            return output
+
         num_splits = min(self.decode_seq_len_splits, num_requests)
         if num_splits == 1:
             return run_group(query, block_tables, seq_lens, out)

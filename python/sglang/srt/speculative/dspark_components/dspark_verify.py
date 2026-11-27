@@ -34,6 +34,9 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
+from sglang.kernels.ops.speculative.dspark.sparse_topk_rejection import (
+    sparse_topk_rejection,
+)
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -45,7 +48,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dflash_utils import (
+    _dflash_topk_support,
+    apply_dflash_verify_logits_adjustments,
+)
 from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
     DeferredContextCommit,
 )
@@ -1268,6 +1274,53 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
+    max_top_k = draft_input.max_top_k
+    if (
+        envs.SGLANG_OPT_DSPARK_SPARSE_TOPK_REJECTION.get()
+        and torch.version.cuda is not None
+        and target_logits.is_cuda
+        and not block_verification
+        and not sampling_info.is_any_greedy
+        and sampling_info.need_top_k_sampling
+        and 0 < max_top_k <= 64
+        and max_top_k < target_logits.shape[-1]
+        and target_logits.shape[-1] < (1 << 25)
+        and gamma > 0
+        and candidates.stride(-1) == 1
+        and candidates.shape[1] == verify_num_draft_tokens == gamma + 1
+        and (
+            draft_block.greedy_draft
+            or (
+                draft_block.corrected_logits.stride(-1) == 1
+                and draft_block.corrected_logits.shape[-1] == target_logits.shape[-1]
+            )
+        )
+    ):
+        scaled_logits = target_logits
+        if not draft_input.unit_temperature:
+            temperatures = torch.repeat_interleave(
+                sampling_info.temperatures, verify_num_draft_tokens, dim=0
+            )
+            scaled_logits = target_logits / temperatures
+        top_ids, top_probs = _dflash_topk_support(
+            scaled_logits,
+            sampling_info,
+            verify_num_draft_tokens,
+            max_top_k,
+            draft_input.uniform_top_k_value,
+        )
+        return sparse_topk_rejection(
+            candidates=candidates,
+            top_indices=top_ids,
+            top_probs=top_probs,
+            draft_logits=(
+                None if draft_block.greedy_draft else draft_block.corrected_logits
+            ),
+            draft_temperatures=draft_block.temperatures,
+            vocab=target_logits.shape[-1],
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+
     if _blockwise_rejection_applies(
         sampling_info=sampling_info,
         rejection_noise=rejection_noise,

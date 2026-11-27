@@ -44,6 +44,7 @@ class DFlashDraftInputV2(SpecInput):
     hidden_states: torch.Tensor
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
+    unit_temperature: bool = False
     nxt_kv_lens_cpu: Optional[torch.Tensor] = None
     nxt_kv_lens_sum: Optional[int] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -156,12 +157,14 @@ class DFlashDraftInputV2(SpecInput):
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
+        unit_temperature = True
         nxt_kv_lens_sum = 0
         committed_seq_lens_sum = 0
         for i, (req, cur, nxt) in enumerate(zip(batch.reqs, cur_kv_lens, nxt_kv_lens)):
             committed_len = int(req.kv.kv_committed_len)
             committed_seq_lens_sum += committed_len
             top_k = int(req.sampling_params.top_k)
+            unit_temperature = unit_temperature and req.sampling_params.temperature == 1.0
 
             batch_seq_lens_cpu_t[i] = committed_len
             cur_kv_lens_cpu_t[i] = cur
@@ -176,6 +179,7 @@ class DFlashDraftInputV2(SpecInput):
                 uniform_top_k = False
 
         self.max_top_k = max(max_top_k, 1)
+        self.unit_temperature = unit_temperature
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
         caller_stream = None

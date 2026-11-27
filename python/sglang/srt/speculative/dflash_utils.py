@@ -1035,6 +1035,31 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+def _dflash_topk_support(
+    scaled_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    max_top_k: int,
+    uniform_top_k_value: Optional[int],
+    repeated_top_ks: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply top-p to probabilities already normalized over the retained top-k."""
+    topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
+    if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
+        if repeated_top_ks is None:
+            repeated_top_ks = torch.repeat_interleave(
+                sampling_info.top_ks, draft_token_num, dim=0
+            ).clamp(min=1, max=scaled_logits.shape[-1])
+        ranks = torch.arange(max_top_k, device=scaled_logits.device)[None, :]
+        valid = ranks < repeated_top_ks.unsqueeze(1)
+        topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
+    topk_probs = F.softmax(topk_logits, dim=-1)
+    if bool(getattr(sampling_info, "need_top_p_sampling", False)):
+        top_ps = torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
+        topk_probs = _dflash_top_p_renorm_prob(topk_probs, top_ps)
+    return topk_indices, topk_probs
+
+
 def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -1071,21 +1096,10 @@ def build_speculative_verify_target_probs(
 
         # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
         if 0 < max_top_k < vocab_size:
-            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
-            if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
-                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
-                    None, :
-                ]
-                valid = ranks < repeated_top_ks.unsqueeze(1)
-                topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
-
-            topk_probs = F.softmax(topk_logits, dim=-1)
-            if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
-                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
-
+            topk_indices, topk_probs = _dflash_topk_support(
+                scaled_logits, sampling_info, draft_token_num, max_top_k,
+                uniform_top_k_value, repeated_top_ks,
+            )
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
             sparse_topk_applied = True

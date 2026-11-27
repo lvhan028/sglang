@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 
 import torch
+from flashinfer.sampling import top_p_renorm_probs
 
 from sglang.kernels.ops.speculative.dspark.dspark_accept import SoftmaxTemp
 from sglang.kernels.ops.speculative.dspark.sparse_topk_rejection import sparse_topk_rejection
@@ -125,6 +126,65 @@ class SparseRejectionTest(unittest.TestCase):
             graph.replay()
             for got, want in zip(actual, expected):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_width20_fused_top_p_preserves_rejection(self):
+        bs, slots, vocab = 160, 4, 257
+        d = "cuda"
+        torch.manual_seed(92900)
+        scores = torch.randn(bs, slots, vocab, device=d)
+        values, indices = scores.topk(20, dim=-1)
+        probs = values.softmax(-1)
+        boundary = probs[:, 0].cumsum(-1)[:, 15].contiguous()
+        thresholds = [
+            torch.full_like(boundary, 0.95),
+            boundary,
+            torch.nextafter(boundary, torch.zeros_like(boundary)),
+            torch.nextafter(boundary, torch.ones_like(boundary)),
+            torch.ones_like(boundary),
+        ]
+        selection = torch.randint(20, (bs, slots - 1, 1), device=d)
+        candidates = torch.cat(
+            (torch.zeros(bs, 1, dtype=torch.int64, device=d),
+             indices[:, :-1].gather(-1, selection).squeeze(-1)),
+            dim=1,
+        )
+        # Force some requests through the last bonus row and sample the
+        # residual CDF on others, using the same draws in both paths.
+        coins = torch.rand(bs, slots - 1, device=d)
+        coins[::3] = 0
+        final_coins = torch.rand(bs, device=d)
+        cutoff = torch.randint(1, slots + 1, (bs,), dtype=torch.int32, device=d)
+        for greedy in (False, True):
+            for top_p in thresholds:
+                kwargs = dict(
+                    candidates=candidates,
+                    top_indices=indices.reshape(-1, 20),
+                    draft_logits=None if greedy else scores[:, :-1].contiguous(),
+                    draft_temperatures=torch.ones(bs, device=d),
+                    vocab=vocab,
+                    cutoff_verify_lens=cutoff,
+                    coins=coins,
+                    final_coins=final_coins,
+                )
+                expected = sparse_topk_rejection(
+                    **kwargs,
+                    top_probs=top_p_renorm_probs(
+                        probs.reshape(-1, 20), top_p.repeat_interleave(slots)
+                    ),
+                )
+                got = sparse_topk_rejection(
+                    **kwargs, top_probs=probs.reshape(-1, 20), target_top_ps=top_p
+                )
+                for actual, wanted in zip(got, expected):
+                    torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = sparse_topk_rejection(
+                        **kwargs, top_probs=probs.reshape(-1, 20), target_top_ps=top_p
+                    )
+                graph.replay()
+                for actual, wanted in zip(captured, expected):
+                    torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
 
     @unittest.skipUnless(os.getenv("DSPARK_BENCH_SPARSE_TOPK") == "1", "timing is opt-in")
     def test_b160_latency(self):

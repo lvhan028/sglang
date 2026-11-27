@@ -1044,6 +1044,7 @@ def _dflash_topk_support(
     repeated_top_ks: Optional[torch.Tensor] = None,
     *,
     select_topk: Callable[[torch.Tensor, int], Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
+    apply_top_p: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply top-p to probabilities already normalized over the retained top-k."""
     topk_logits, topk_indices = select_topk(scaled_logits, max_top_k)
@@ -1056,7 +1057,7 @@ def _dflash_topk_support(
         valid = ranks < repeated_top_ks.unsqueeze(1)
         topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
     topk_probs = F.softmax(topk_logits, dim=-1)
-    if bool(getattr(sampling_info, "need_top_p_sampling", False)):
+    if apply_top_p and bool(getattr(sampling_info, "need_top_p_sampling", False)):
         top_ps = torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0)
         topk_probs = _dflash_top_p_renorm_prob(topk_probs, top_ps)
     return topk_indices, topk_probs

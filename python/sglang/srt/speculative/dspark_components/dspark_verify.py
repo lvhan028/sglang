@@ -35,6 +35,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample_graph,
 )
 from sglang.kernels.ops.speculative.dspark.sparse_topk_rejection import (
+    can_fuse_b300_top_p,
     select_b300_topk,
     sparse_topk_rejection,
 )
@@ -1309,6 +1310,12 @@ def accept_draft_tokens(
             and draft_input.uniform_top_k_value == max_top_k
         ):
             select_topk = select_b300_topk
+        fused_top_p = (
+            envs.SGLANG_OPT_DSPARK_B300_FUSED_TOP_P.get()
+            and sampling_info.need_top_p_sampling
+            and draft_input.uniform_top_k_value == max_top_k
+            and can_fuse_b300_top_p(scaled_logits, max_top_k)
+        )
         top_ids, top_probs = _dflash_topk_support(
             scaled_logits,
             sampling_info,
@@ -1316,6 +1323,7 @@ def accept_draft_tokens(
             max_top_k,
             draft_input.uniform_top_k_value,
             select_topk=select_topk,
+            apply_top_p=not fused_top_p,
         )
         return sparse_topk_rejection(
             candidates=candidates,
@@ -1327,6 +1335,7 @@ def accept_draft_tokens(
             draft_temperatures=draft_block.temperatures,
             vocab=target_logits.shape[-1],
             cutoff_verify_lens=cutoff_verify_lens,
+            target_top_ps=sampling_info.top_ps if fused_top_p else None,
         )
 
     if _blockwise_rejection_applies(

@@ -8,8 +8,10 @@ import triton.language as tl
 
 
 try:
+    from flashinfer import __version__ as _flashinfer_version
     from flashinfer.topk import TopKTieBreak, top_k as _flashinfer_top_k
 except ImportError:
+    _flashinfer_version = None
     _flashinfer_top_k = None
 
 
@@ -35,6 +37,19 @@ def select_b300_topk(
     return _flashinfer_top_k(
         logits, k, sorted=True, deterministic=True, tie_break=TopKTieBreak.SMALL
     )
+
+
+def can_fuse_b300_top_p(logits: torch.Tensor, k: int) -> bool:
+    return (
+        _flashinfer_version == "0.7.3"
+        and k == 20
+        and logits.dtype == torch.float32
+        and logits.shape == (640, 248320)
+        and logits.is_cuda
+        and torch.version.cuda is not None
+        and torch.cuda.get_device_capability(logits.device) == (10, 3)
+    )
+
 
 _DRAFT_TILE = 8192
 
@@ -73,19 +88,80 @@ def _draft_prob_at(
 
 
 @triton.jit
+def _sum_width20_vec4(p):
+    # FlashInfer's FP32 width-20 path uses five vector-4 loads in the
+    # first warp. CUB combines those sums in shuffle offsets 1, 2, 4.
+    evens, odds = tl.split(tl.reshape(p, (16, 2)))
+    v0, v2 = tl.split(tl.reshape(evens, (8, 2)))
+    v1, v3 = tl.split(tl.reshape(odds, (8, 2)))
+    groups = ((v0 + v1) + v2) + v3
+    g0 = tl.sum(tl.gather(groups, tl.full((1,), 0, tl.int32), 0), 0)
+    g1 = tl.sum(tl.gather(groups, tl.full((1,), 1, tl.int32), 0), 0)
+    g2 = tl.sum(tl.gather(groups, tl.full((1,), 2, tl.int32), 0), 0)
+    g3 = tl.sum(tl.gather(groups, tl.full((1,), 3, tl.int32), 0), 0)
+    g4 = tl.sum(tl.gather(groups, tl.full((1,), 4, tl.int32), 0), 0)
+    return ((g0 + g1) + (g2 + g3)) + g4
+
+
+@triton.jit
+def _flashinfer_073_width20_top_p(p, cutoff):
+    # Preserve the native pivot search, including equal probabilities
+    # at the boundary and exact FP32 comparisons against top-p.
+    retained = p
+    if cutoff < 1.0:
+        low = 0.0
+        high = tl.max(tl.where(p > 0.0, p, 0.0), 0)
+        s = 1.0
+        searching = True
+        while searching:
+            t0 = tl.div_rn(high + 2.0 * low, 3.0)
+            t1 = tl.div_rn(2.0 * high + low, 3.0)
+            after_low = tl.min(tl.where(p > low, p, high), 0)
+            before_high = tl.max(tl.where(p <= high, p, low), 0)
+            m0 = _sum_width20_vec4(tl.where(p > t0, p, 0.0))
+            m1 = _sum_width20_vec4(tl.where(p > t1, p, 0.0))
+            if m1 >= cutoff:
+                low = t1
+                s = m1
+            elif m0 >= cutoff:
+                low = t0
+                high = tl.minimum(t1, before_high)
+                s = m0
+            else:
+                high = tl.minimum(t0, before_high)
+            next_after = (after_low.to(tl.int32, bitcast=True) + 1).to(tl.float32, bitcast=True)
+            searching = (after_low < before_high) & (next_after < before_high)
+        retained = tl.where(p > low, p, 0.0)
+        s = tl.maximum(s, 1e-8)
+    else:
+        s = _sum_width20_vec4(p)
+        s = tl.where(s <= 1e-8, 1.0, s)
+
+    rcp = tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;",
+        constraints="=f,f", args=[s], dtype=tl.float32, is_pure=True, pack=1,
+    )
+    return retained * rcp
+
+
+@triton.jit
 def _sparse_topk_rejection_kernel(
-    candidates, top_indices, top_probs, draft_logits, draft_temp, maxima, sums,
+    candidates, top_indices, top_probs, target_top_ps, draft_logits, draft_temp, maxima, sums,
     coins, final_coins, cutoff, correct_len, bonus, trim, vocab,
     candidate_stride, draft_row_stride, draft_step_stride, cutoff_stride,
     GAMMA: tl.constexpr, TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr,
     TILES: tl.constexpr, PADDED_TILES: tl.constexpr,
-    HAS_DRAFT: tl.constexpr, HAS_CUTOFF: tl.constexpr,
+    HAS_DRAFT: tl.constexpr, HAS_CUTOFF: tl.constexpr, FUSE_TOP_P: tl.constexpr,
 ):
     req = tl.program_id(0)
     candidate_ptr = candidates + req * candidate_stride
     target_base = req * (GAMMA + 1) * TOP_K
     lane = tl.arange(0, TOP_K_PAD)
     active = lane < TOP_K
+    cutoff_prob = 1.0
+    if FUSE_TOP_P:
+        cutoff_prob = tl.load(target_top_ps + req)
+
     temp = 1.0
     if HAS_DRAFT:
         temp = tl.load(draft_temp + req).to(tl.float32)
@@ -97,6 +173,9 @@ def _sparse_topk_rejection_kernel(
             offset = target_base + step * TOP_K + lane
             ids = tl.load(top_indices + offset, active, other=-1)
             weights = tl.load(top_probs + offset, active, other=0.0)
+            if FUSE_TOP_P:
+                weights = _flashinfer_073_width20_top_p(weights, cutoff_prob)
+                weights = tl.where(active, weights, 0.0)
             p = tl.sum(tl.where(ids == token, weights, 0.0))
             q = 1.0
             if HAS_DRAFT:
@@ -122,8 +201,16 @@ def _sparse_topk_rejection_kernel(
         sorted_keys = tl.sort(ids * TOP_K_PAD + lane, descending=False)
         ids = sorted_keys // TOP_K_PAD
         original_lane = sorted_keys % TOP_K_PAD
-        p = tl.load(top_probs + target_base + accepted * TOP_K + original_lane,
-                    original_lane < TOP_K, other=0.0)
+        if FUSE_TOP_P:
+            # Top-p reduces in top-k rank order. Only reorder afterward to
+            # preserve the token-ID CDF's behavior with identical draws.
+            p = tl.load(top_probs + offset, active, other=0.0)
+            p = _flashinfer_073_width20_top_p(p, cutoff_prob)
+            p = tl.gather(p, original_lane, axis=0)
+            p = tl.where(original_lane < TOP_K, p, 0.0)
+        else:
+            p = tl.load(top_probs + target_base + accepted * TOP_K + original_lane,
+                        original_lane < TOP_K, other=0.0)
         weights = p
         if accepted < GAMMA:
             if HAS_DRAFT:
@@ -160,12 +247,15 @@ def sparse_topk_rejection(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     coins: Optional[torch.Tensor] = None,
     final_coins: Optional[torch.Tensor] = None,
+    target_top_ps: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Verify a linear chain without materializing dense target or draft probabilities."""
     bs, slots = candidates.shape
     gamma = slots - 1
     top_k = top_indices.shape[-1]
     device = candidates.device
+    if target_top_ps is not None and (top_k != 20 or target_top_ps.numel() != bs):
+        raise ValueError("Fused top-p requires width 20 and one probability per request")
     if coins is None:
         coins = torch.rand((bs, gamma), dtype=torch.float32, device=device)
     if final_coins is None:
@@ -190,6 +280,7 @@ def sparse_topk_rejection(
 
     _sparse_topk_rejection_kernel[(bs,)](
         candidates, top_indices.contiguous(), top_probs.contiguous(),
+        target_top_ps.reshape(-1).contiguous() if target_top_ps is not None else top_probs,
         draft_logits if has_draft else top_probs, temperatures, maxima, sums,
         coins, final_coins,
         cutoff_verify_lens if cutoff_verify_lens is not None else lens,
@@ -198,6 +289,7 @@ def sparse_topk_rejection(
         GAMMA=gamma, TOP_K=top_k, TOP_K_PAD=triton.next_power_of_2(top_k),
         TILES=n_tiles, PADDED_TILES=triton.next_power_of_2(n_tiles),
         HAS_DRAFT=has_draft, HAS_CUTOFF=cutoff_verify_lens is not None,
+        FUSE_TOP_P=target_top_ps is not None,
         num_warps=1, enable_fp_fusion=False,
     )
     return lens[0], bonus, lens[1]

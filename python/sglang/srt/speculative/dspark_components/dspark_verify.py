@@ -1297,7 +1297,7 @@ def accept_draft_tokens(
         )
     ):
         scaled_logits = target_logits
-        if not draft_input.unit_temperature:
+        if not draft_input.unit_temperature or target_logits.dtype != torch.float32:
             temperatures = torch.repeat_interleave(
                 sampling_info.temperatures, verify_num_draft_tokens, dim=0
             )

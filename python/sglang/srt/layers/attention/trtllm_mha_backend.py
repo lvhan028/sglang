@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_buffer,
     get_exec,
     get_parallel,
@@ -421,6 +422,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and torch.device(self.device).type == "cuda"
             and torch.version.cuda is not None
             and torch.cuda.get_device_capability(self.device) == (10, 3)
+        )
+        self.use_b300_shared_prefix_groups = (
+            self.use_b300_contiguous_verify
+            and get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+            and envs.SGLANG_OPT_PD_GDN_FULL_KV_PREFIX.get()
+            and envs.SGLANG_OPT_TRTLLM_MHA_B300_PREFIX_GROUPS.get()
         )
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
@@ -1549,12 +1557,51 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and mask is None
             and kv_cache_sf is None
         ):
-            # Lay out three single-wave launches without moving request rows.
             output = (
                 out
                 if out is not None
                 else torch.empty_like(query, dtype=resolved_out_dtype)
             )
+            if (
+                getattr(self, "use_b300_shared_prefix_groups", False)
+                and block_tables.shape[1] > 512
+                and window_left < 0
+                and sinks is None
+            ):
+                # A shared page at this depth identifies a long cached prefix.
+                # Sort only the FMHA inputs, then restore the original request
+                # order before any downstream verify or sampling operation.
+                keys = torch.where(
+                    seq_lens >= 513 * 64,
+                    block_tables[:, 512],
+                    torch.iinfo(torch.int32).max,
+                )
+                order = torch.argsort(keys, stable=True)
+                q_by_request = query.view(160, 4, 16, 256)
+                # Gather FP8 values bytewise; index_select support varies by dtype.
+                grouped_query = (
+                    q_by_request.view(torch.uint8)
+                    .index_select(0, order)
+                    .view(query.dtype)
+                    .view_as(query)
+                )
+                grouped_tables = block_tables.index_select(0, order)
+                grouped_lens = seq_lens.index_select(0, order)
+                grouped_out = torch.empty_like(output)
+                for lo in range(0, 160, 32):
+                    hi = lo + 32
+                    run_group(
+                        grouped_query[lo * 4 : hi * 4],
+                        grouped_tables[lo:hi],
+                        grouped_lens[lo:hi],
+                        grouped_out[lo * 4 : hi * 4],
+                    )
+                output.view_as(q_by_request).index_copy_(
+                    0, order, grouped_out.view_as(q_by_request)
+                )
+                return output
+
+            # Lay out three single-wave launches without moving request rows.
             for lo, hi in ((0, 54), (54, 107), (107, 160)):
                 first, last = lo * q_len_per_req, hi * q_len_per_req
                 run_group(

@@ -589,6 +589,7 @@ class Envs:
     # exact in law, counter-based draws agree across TP ranks) instead of the classic kernel.
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
     SGLANG_OPT_DSPARK_SPARSE_TOPK_REJECTION = EnvBool(False)
+    SGLANG_OPT_DSPARK_B300_FLASHINFER_TOPK = EnvBool(False)
     SGLANG_OPT_GDN_REPLAYSSM_B300_VERIFY = EnvBool(False)
     SGLANG_OPT_GDN_CONV1D_Q4 = EnvBool(False)
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)

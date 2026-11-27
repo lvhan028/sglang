@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -1042,9 +1042,11 @@ def _dflash_topk_support(
     max_top_k: int,
     uniform_top_k_value: Optional[int],
     repeated_top_ks: Optional[torch.Tensor] = None,
+    *,
+    select_topk: Callable[[torch.Tensor, int], Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply top-p to probabilities already normalized over the retained top-k."""
-    topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
+    topk_logits, topk_indices = select_topk(scaled_logits, max_top_k)
     if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
         if repeated_top_ks is None:
             repeated_top_ks = torch.repeat_interleave(

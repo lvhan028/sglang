@@ -6,6 +6,36 @@ import torch
 import triton
 import triton.language as tl
 
+
+try:
+    from flashinfer.topk import TopKTieBreak, top_k as _flashinfer_top_k
+except ImportError:
+    _flashinfer_top_k = None
+
+
+def select_b300_topk(
+    logits: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the same support as the pinned CUDA multiblock Top-K."""
+    if (
+        _flashinfer_top_k is None
+        or logits.dtype != torch.float32
+        or logits.shape != (640, 248320)
+        or not logits.is_contiguous()
+        or not logits.is_cuda
+        or torch.version.cuda is None
+        or not 1 < k <= 32
+        or torch.cuda.get_device_capability(logits.device) != (10, 3)
+    ):
+        return torch.topk(logits, k)
+
+    # Torch 2.14's CUDA multiblock gather selects lower token IDs when a
+    # tie crosses the K boundary. Order within the selected equal logits
+    # can differ. Top-p thresholds by value and the final CDF sorts by ID.
+    return _flashinfer_top_k(
+        logits, k, sorted=True, deterministic=True, tie_break=TopKTieBreak.SMALL
+    )
+
 _DRAFT_TILE = 8192
 
 

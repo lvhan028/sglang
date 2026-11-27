@@ -35,6 +35,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample_graph,
 )
 from sglang.kernels.ops.speculative.dspark.sparse_topk_rejection import (
+    select_b300_topk,
     sparse_topk_rejection,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
@@ -1302,12 +1303,19 @@ def accept_draft_tokens(
                 sampling_info.temperatures, verify_num_draft_tokens, dim=0
             )
             scaled_logits = target_logits / temperatures
+        select_topk = torch.topk
+        if (
+            envs.SGLANG_OPT_DSPARK_B300_FLASHINFER_TOPK.get()
+            and draft_input.uniform_top_k_value == max_top_k
+        ):
+            select_topk = select_b300_topk
         top_ids, top_probs = _dflash_topk_support(
             scaled_logits,
             sampling_info,
             verify_num_draft_tokens,
             max_top_k,
             draft_input.uniform_top_k_value,
+            select_topk=select_topk,
         )
         return sparse_topk_rejection(
             candidates=candidates,

@@ -1485,6 +1485,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
+        verify_nk = 2
+        if (
+            envs.SGLANG_OPT_GDN_REPLAYSSM_B300_VERIFY.get()
+            and (H, HV, K, V, max_cache_len, draft_token_num) == (16, 32, 128, 128, 16, 4)
+            and query_start_loc.numel() == 161
+            and layer_cache.temporal.dtype == torch.float32
+            and layer_cache.replayssm_rawv is not None
+            and layer_cache.replayssm_rawk is not None
+            and torch.version.cuda is not None
+            and q.is_cuda
+            and torch.cuda.get_device_capability(q.device) == (10, 3)
+        ):
+            # Smaller K tiles reduce the verify kernel's register working set.
+            verify_nk = 4
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
@@ -1521,6 +1535,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             null_block_id=-1,
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
+            nk=verify_nk,
             launch_mode="verify",
         )
         # Match the recurrent target_verify output shape (== value.shape).

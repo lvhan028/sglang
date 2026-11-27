@@ -438,6 +438,38 @@ def build_kv_cache(
             sliding_window_size,
         )
 
+    if (
+        envs.SGLANG_OPT_PD_GDN_FULL_KV_PREFIX.get()
+        and get_disagg().disaggregation_mode == "decode"
+    ):
+        if (
+            not get_disagg().disaggregation_decode_enable_radix_cache
+            or not is_hybrid_ssm
+            or is_hybrid_swa
+            or model_config.hf_config.model_type != "qwen3_5_moe"
+            or enable_hierarchical_cache
+            or get_exec().mamba.enable_mamba_extra_buffer
+            or get_memory().enable_session_radix_cache
+            or retraction_backup == "host_pool"
+            or get_disagg().disaggregation_transfer_backend != "mooncake"
+            or get_disagg().disaggregation_decode_enable_offload_kvcache
+            or not spec_algorithm.is_dspark()
+            or parallel.tp_size != 1
+        ):
+            raise ValueError(
+                "Full-KV-only decode prefix reuse requires Qwen GDN, "
+                "device-resident radix cache, Mooncake P/D and TP1 DSpark"
+            )
+        from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+        from sglang.srt.mem_cache.unified_cache.components.mamba import (
+            DecodeRequestMambaComponent,
+        )
+
+        params.component_registry_override = {
+            ComponentType.MAMBA: DecodeRequestMambaComponent
+        }
+        logger.info("D radix reuses full KV with request-local GDN state")
+
     tree_context = TreeCacheBuildContext(
         server_args=server_args,
         params=params,

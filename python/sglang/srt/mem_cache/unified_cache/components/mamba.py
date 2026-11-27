@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
+    stores_radix_checkpoints = True
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -74,7 +75,11 @@ class MambaComponent(TreeComponent):
         )
         # Without the extra buffer only the sequence-end state exists, so a cached
         # state needs page 1; a disabled tree caches none.
-        if not params.enable_mamba_extra_buffer and not params.disable:
+        if (
+            self.stores_radix_checkpoints
+            and not params.enable_mamba_extra_buffer
+            and not params.disable
+        ):
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
@@ -1147,3 +1152,49 @@ class _MambaBufferLoadBackContext(BufferLoadBackContext):
         if not insert_result.mamba_exist:
             return []
         return [(PoolName.MAMBA, self.node_copy.device_indices)]
+
+
+class DecodeRequestMambaComponent(MambaComponent):
+    """Keep only full KV in the tree; Prefill sends each request's GDN state.
+
+    Reuse MambaComponent's request-pool bookkeeping, without donating or
+    restoring recurrent checkpoints. This is for the guarded P/D path in
+    which Mooncake sends the request state even when attention KV hits.
+    """
+
+    stores_radix_checkpoints = False
+
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
+        return lambda node: True
+
+    def prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        is_finished: bool,
+    ) -> Optional[int]:
+        # The full component can cache every committed, page-aligned token.
+        return None
+
+    def commit_insert_component_data(
+        self,
+        node: UnifiedTreeNode,
+        is_new_leaf: bool,
+        params: InsertParams,
+        result: InsertResult,
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        assert params.mamba_value is None
+
+    def cleanup_after_caching_req(
+        self,
+        req: Req,
+        is_finished: bool,
+        insert_result: Optional[InsertResult] = None,
+        insert_params: Optional[InsertParams] = None,
+    ) -> None:
+        if is_finished:
+            self.cache.req_to_token_pool.free_mamba_cache(req)

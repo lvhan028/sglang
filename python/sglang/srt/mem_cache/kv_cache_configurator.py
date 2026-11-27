@@ -3060,7 +3060,11 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        if get_memory().disable_radix_cache:
+        if get_memory().disable_radix_cache or (
+            envs.SGLANG_OPT_PD_GDN_FULL_KV_PREFIX.get()
+            and get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+        ):
             return 1
 
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()

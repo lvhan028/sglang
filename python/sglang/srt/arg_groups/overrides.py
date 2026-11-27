@@ -473,6 +473,19 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     if view.disable_radix_cache:
         return {}
 
+    if (
+        envs.SGLANG_OPT_PD_GDN_FULL_KV_PREFIX.get()
+        and view.disaggregation_mode == "decode"
+        and view.disaggregation_decode_enable_radix_cache
+        and hf_config.model_type == "qwen3_5_moe"
+    ):
+        # This decode tree shares attention pages only. RDMA supplies the
+        # separate live GDN slot, so no snapshots or page-1 constraint apply.
+        return {
+            "uses_mamba_radix_cache": False,
+            "mamba_radix_cache_strategy": "no_buffer",
+        }
+
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule

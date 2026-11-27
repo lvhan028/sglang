@@ -590,6 +590,7 @@ class Envs:
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
     SGLANG_OPT_DSPARK_SPARSE_TOPK_REJECTION = EnvBool(False)
     SGLANG_OPT_GDN_REPLAYSSM_B300_VERIFY = EnvBool(False)
+    SGLANG_OPT_GDN_CONV1D_Q4 = EnvBool(False)
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)
     # in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(False)

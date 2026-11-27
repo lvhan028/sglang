@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 
 PAD_SLOT_ID = -1
 
@@ -663,6 +664,7 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    LINEAR_Q4_FAST_PATH: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
@@ -734,55 +736,56 @@ def _causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    # STEP 2: assume state_len > seqlen
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
-
-    # The conv_state updates works in a sliding window manner,
-    # at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-            :, None
-        ]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (
-        (conv_state_batch_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
-        & (idx_feats < dim)[None, :]
-    )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
-
-    VAL = state_len - seqlen
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    if not LINEAR_Q4_FAST_PATH:
+        # STEP 2: assume state_len > seqlen
 
-    x_ptrs = (
-        x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
+        # The conv_state updates works in a sliding window manner,
+        # at each forward pass, the tokens are shift by 1, so we
+        # load since idx_tokens + 1.
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
+                :, None
+            ]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (
+            (conv_state_batch_coord < num_cache_lines)
+            & ((idx_tokens + seqlen) < state_len)[:, None]
+            & (idx_feats < dim)[None, :]
+        )
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-    mask_x = (
-        (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
-        & (idx_feats < dim)[None, :]
-    )  # token-index  # token-index  # feature-index
-    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    tl.debug_barrier()
+        VAL = state_len - seqlen
 
-    new_conv_state = tl.where(mask, conv_state, loaded_x)
+        x_ptrs = (
+            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
 
-    conv_state_base = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
-    )  # [BLOCK_N,]
-    conv_state_ptrs_target = (
-        conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+        mask_x = (
+            (idx_tokens - VAL >= 0)[:, None]
+            & (idx_tokens - VAL < seqlen)[:, None]
+            & (idx_feats < dim)[None, :]
+        )  # token-index  # token-index  # feature-index
+        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+        tl.debug_barrier()
+
+        new_conv_state = tl.where(mask, conv_state, loaded_x)
+
+        conv_state_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )  # [BLOCK_N,]
+        conv_state_ptrs_target = (
+            conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -986,9 +989,11 @@ def _causal_conv1d_update_kernel(
                     + idx_token * stride_inter_step
                     + idx_feats * stride_inter_dim
                 )
-                if KERNEL_WIDTH >= 2:
+                # Adjacent windows share physical slots in the deduplicated
+                # linear layout. Write the first window, then only its new tail.
+                if KERNEL_WIDTH >= 2 and ((not LINEAR_Q4_FAST_PATH) or idx_token == 0):
                     tl.store(base_ptr + 0 * stride_inter_win, col0, mask=mask_w)
-                if KERNEL_WIDTH >= 3:
+                if KERNEL_WIDTH >= 3 and ((not LINEAR_Q4_FAST_PATH) or idx_token == 0):
                     tl.store(base_ptr + 1 * stride_inter_win, col1, mask=mask_w)
                 if KERNEL_WIDTH >= 4:
                     tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
@@ -1016,6 +1021,13 @@ def _causal_conv1d_update_kernel(
                 parent_idx_tokens,
                 mask=mask_retrieve,
             )
+
+    if LINEAR_Q4_FAST_PATH:
+        # Q4/width-4 has consumed X1..X3 by this point. They are the same
+        # three values the old state update loaded before the convolution.
+        tl.store(conv_states_base, col0, mask=mask_w)
+        tl.store(conv_states_base + stride_conv_state_tok, col1, mask=mask_w)
+        tl.store(conv_states_base + 2 * stride_conv_state_tok, col2, mask=mask_w)
 
 
 def causal_conv1d_update(
@@ -1165,6 +1177,26 @@ def causal_conv1d_update(
 
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
+    linear_q4_fast_path = (
+        envs.SGLANG_OPT_GDN_CONV1D_Q4.get()
+        and batch == 160
+        and dim == 8192
+        and seqlen == 4
+        and width == 4
+        and state_len == 3
+        and num_accept_tokens is None
+        and cache_seqlens is None
+        and retrieve_next_token is None
+        and conv_state_indices is not None
+        and intermediate_conv_window is not None
+        and intermediate_state_indices is not None
+        and stride_inter_step == stride_inter_win
+        and x.dtype == torch.bfloat16
+        and x.is_cuda
+        and torch.version.cuda is not None
+        and torch.cuda.get_device_capability(x.device) == (10, 3)
+    )
+
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1221,9 +1253,10 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=128 if linear_q4_fast_path else 256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        LINEAR_Q4_FAST_PATH=linear_q4_fast_path,
         **pdl_kwargs,
     )
     if unsqueeze:
